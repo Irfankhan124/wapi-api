@@ -10,10 +10,31 @@ const envConfig = config[env] || config.production || config.development || {};
 
 const connectDB = async () => {
   try {
-    const mongoUri = process.env.MONGO_URI || process.env.MONGODB_URI || envConfig?.mongoUri;
+    const mongoUri =
+      process.env.MONGO_URI ||
+      process.env.MONGODB_URI ||
+      process.env.MONGO_URL ||
+      process.env.DATABASE_URL ||
+      process.env.DB_URI ||
+      envConfig?.mongoUri;
+
+    console.log('MongoDB env check:', {
+      NODE_ENV: process.env.NODE_ENV || 'not set',
+      MONGO_URI: process.env.MONGO_URI ? 'set' : 'missing',
+      MONGODB_URI: process.env.MONGODB_URI ? 'set' : 'missing',
+      MONGO_URL: process.env.MONGO_URL ? 'set' : 'missing',
+      DATABASE_URL: process.env.DATABASE_URL ? 'set' : 'missing',
+      DB_URI: process.env.DB_URI ? 'set' : 'missing',
+    });
+
     if (!mongoUri) {
-      throw new Error('MongoDB URI is missing. Add MONGO_URI and MONGODB_URI in Render Environment variables.');
+      throw new Error('MongoDB URI is missing. Add MONGO_URI and MONGODB_URI in Render → wapi-api → Environment, save changes, then redeploy.');
     }
+
+    if (mongoUri.includes('127.0.0.1') || mongoUri.includes('localhost')) {
+      throw new Error('MongoDB URI is still localhost. Replace it in Render Environment with your MongoDB Atlas mongodb+srv:// URL.');
+    }
+
     console.log('Connecting to MongoDB:', mongoUri.replace(/:\/\/([^:]+):([^@]+)@/, '://$1:***@'));
     await mongoose.connect(mongoUri);
     console.log('MongoDB connected successfully');
