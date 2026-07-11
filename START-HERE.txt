@@ -1,0 +1,19 @@
+WAPI BACKEND API DEPLOY KIT
+
+This folder is ONLY for the backend API. Deploy admin/frontend separately.
+
+Fastest VPS deploy:
+1) Copy this wapi-api folder to your VPS.
+2) cd wapi-api
+3) cp .env.production.example .env
+4) Edit .env and set APP_URL, FRONTEND_URL, ALLOWED_ORIGINS, JWT_SECRET, admin email/password.
+5) Run: ./deploy/scripts/deploy-docker.sh
+6) Test: http://YOUR_SERVER_IP:5000/
+7) Add Nginx + SSL using deploy/nginx/wapi-api.conf.
+
+For Windows Docker Desktop:
+1) Open this folder.
+2) Copy .env.production.example to .env and edit it.
+3) Double-click deploy-windows-docker.bat.
+
+If using Render/Railway, use their Dockerfile deployment and set environment variables manually.

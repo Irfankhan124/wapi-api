@@ -1,0 +1,44 @@
+services:
+  api:
+    build: .
+    container_name: wapi-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 5000
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017/wapi}
+      MONGODB_URI: ${MONGODB_URI:-mongodb://mongo:27017/wapi}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./storage:/app/storage
+    depends_on:
+      - mongo
+      - redis
+
+  mongo:
+    image: mongo:7
+    container_name: wapi-mongo
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    ports:
+      - "127.0.0.1:27017:27017"
+
+  redis:
+    image: redis:7-alpine
+    container_name: wapi-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+
+volumes:
+  mongo_data:
+  redis_data:
