@@ -6,11 +6,15 @@ import config from '../config/config.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const env = process.env.NODE_ENV || 'development';
-const envConfig = config[env];
+const envConfig = config[env] || config.production || config.development || {};
 
 const connectDB = async () => {
   try {
-    const mongoUri = process.env.MONGO_URI || process.env.MONGODB_URI || envConfig.mongoUri;
+    const mongoUri = process.env.MONGO_URI || process.env.MONGODB_URI || envConfig?.mongoUri;
+    if (!mongoUri) {
+      throw new Error('MongoDB URI is missing. Add MONGO_URI and MONGODB_URI in Render Environment variables.');
+    }
+    console.log('Connecting to MongoDB:', mongoUri.replace(/:\/\/([^:]+):([^@]+)@/, '://$1:***@'));
     await mongoose.connect(mongoUri);
     console.log('MongoDB connected successfully');
   } catch (error) {
