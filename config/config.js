@@ -1,15 +1,17 @@
 import 'dotenv/config';
 
-const mongoUri = process.env.MONGO_URI || process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/wapi';
+const mongoUri =
+  process.env.MONGO_URI ||
+  process.env.MONGODB_URI ||
+  process.env.MONGO_URL ||
+  process.env.DATABASE_URL ||
+  process.env.DB_URI ||
+  '';
 
-export default {
-  development: {
-    mongoUri,
-  },
-  production: {
-    mongoUri,
-  },
-  test: {
-    mongoUri,
-  },
+const config = {
+  development: { mongoUri },
+  production: { mongoUri },
+  test: { mongoUri },
 };
+
+export default config;
