@@ -699,6 +699,12 @@ export default class BaileysProvider extends BaseProvider {
         const myNumber = phoneRecord?.display_phone_number || connection.display_phone_number || connection.registred_phone_number;
         const contact = await Contact.findOne({ phone_number: recipientNumber, created_by: userId });
 
+        const waMessageId = result?.key?.id
+            || result?.message?.key?.id
+            || result?.id
+            || result?.messageId
+            || `baileys-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
         const savedMessage = await Message.create({
             sender_number: myNumber,
             recipient_number: recipientNumber,
@@ -710,7 +716,7 @@ export default class BaileysProvider extends BaseProvider {
             file_url: mediaUrl,
             from_me: true,
             direction: 'outbound',
-            wa_message_id: result.key.id,
+            wa_message_id: waMessageId,
             wa_jid: jid,
             wa_timestamp: new Date(),
             provider: 'baileys',
@@ -719,13 +725,14 @@ export default class BaileysProvider extends BaseProvider {
             } : null,
             reply_message_id: params.replyMessageId || null,
             reaction_message_id: params.reactionMessageId || null,
-            template_id: templateId || null
+            template_id: templateId || null,
+            metadata: result || null
         });
 
         return {
             id: savedMessage._id,
             messageId: savedMessage._id,
-            waMessageId: result.key.id,
+            waMessageId,
             status: 'sent'
         };
     }
