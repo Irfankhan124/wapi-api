@@ -1,4 +1,4 @@
-import makeWASocket, {
+﻿import makeWASocket, {
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
@@ -223,7 +223,7 @@ export default class BaileysProvider extends BaseProvider {
 
         sock.ev.on('message-receipt.update', async (updates) => {
             for (const receipt of updates) {
-                const waMessageId = receipt.key.id;
+                const waMessageId = receipt?.key?.id;
                 console.log("receipt.receiptType", receipt.receiptType)
                 const status = receipt.receiptType === 'read' ? 'read' : (receipt.receiptType === 'delivered' ? 'delivered' : null);
 
@@ -251,7 +251,7 @@ export default class BaileysProvider extends BaseProvider {
         sock.ev.on('messages.update', async (updates) => {
             for (const update of updates) {
                 if (update.update.status) {
-                    const waMessageId = update.key.id;
+                    const waMessageId = update?.key?.id;
                     let status = null;
                     console.log("update.update.status", update.update.status)
 
@@ -348,7 +348,7 @@ export default class BaileysProvider extends BaseProvider {
                 }
             }
 
-            const existingMessage = await Message.findOne({ wa_message_id: msg.key.id });
+            const existingMessage = await Message.findOne({ wa_message_id: msg?.key?.id });
             if (existingMessage) {
                 return;
             }
@@ -391,7 +391,7 @@ export default class BaileysProvider extends BaseProvider {
                 file_url: fileUrl,
                 from_me: fromMe,
                 direction: fromMe ? 'outbound' : 'inbound',
-                wa_message_id: msg.key.id,
+                wa_message_id: msg?.key?.id,
                 wa_jid: senderJid,
                 wa_timestamp: new Date(msg.messageTimestamp * 1000),
                 provider: 'baileys',
@@ -483,7 +483,7 @@ export default class BaileysProvider extends BaseProvider {
                         messageType: messageType,
                         userId: userId.toString(),
                         whatsappPhoneNumberId: phone?._id?.toString(),
-                        waMessageId: msg.key.id,
+                        waMessageId: msg?.key?.id,
                         waJid: senderJid,
                         contactId: contact._id.toString(),
                         timestamp: new Date(msg.messageTimestamp * 1000),
@@ -1013,7 +1013,7 @@ export default class BaileysProvider extends BaseProvider {
                             file_url: fileUrl,
                             from_me: fromMe,
                             direction: fromMe ? 'outbound' : 'inbound',
-                            wa_message_id: msg.key.id,
+                            wa_message_id: msg?.key?.id,
                             wa_timestamp: timestamp,
                             provider: 'baileys',
                             reply_message_id: replyMessageId,
@@ -1033,7 +1033,7 @@ export default class BaileysProvider extends BaseProvider {
 
                         messageBulkOps.push({
                             updateOne: {
-                                filter: { wa_message_id: msg.key.id },
+                                filter: { wa_message_id: msg?.key?.id },
                                 update: { $setOnInsert: messagePayload },
                                 upsert: true
                             }
@@ -1098,3 +1098,4 @@ export default class BaileysProvider extends BaseProvider {
         return { success: true };
     }
 }
+
