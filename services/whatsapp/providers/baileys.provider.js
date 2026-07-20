@@ -23,14 +23,38 @@ import {
     handleSequenceReply
 } from '../../../utils/automated-response.service.js';
 
-const logger = pino({ level: 'silent' });
+const logger = pino({ level: process.env.BAILEYS_LOG_LEVEL || 'warn' });
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+
+const digitsOnly = (value) => String(value || '').replace(/\D/g, '');
+
+function extractPhoneNumber(sock, connectionData = {}, authState = null) {
+    const candidates = [
+        String(sock?.user?.id || '').endsWith('@s.whatsapp.net') ? sock.user.id : null,
+        String(authState?.creds?.me?.id || '').endsWith('@s.whatsapp.net') ? authState.creds.me.id : null,
+        connectionData?.registred_phone_number,
+        connectionData?.display_phone_number,
+        connectionData?.phone_number
+    ];
+
+    for (const candidate of candidates) {
+        const digits = digitsOnly(String(candidate || '').split(':')[0].split('@')[0]);
+        if (/^\d{6,15}$/.test(digits)) return digits;
+    }
+
+    const fallback = digitsOnly(String(sock?.user?.id || '').split(':')[0].split('@')[0]);
+    return /^\d{6,15}$/.test(fallback) ? fallback : null;
+}
 
 export default class BaileysProvider extends BaseProvider {
     constructor() {
         super();
         this.sockets = new Map();
+        this.reconnectTimers = new Map();
+        this.reconnectAttempts = new Map();
+        this.connectionGenerations = new Map();
         this.io = null;
     }
 
@@ -51,13 +75,14 @@ export default class BaileysProvider extends BaseProvider {
     }
 
     async initializeConnection(userId, connectionData = null) {
-        const wabaId = connectionData._id || connectionData.id;
+        const wabaId = connectionData?._id || connectionData?.id;
         if (!wabaId) throw new Error('WABA ID is required for Baileys initialization');
 
+        const socketKey = wabaId.toString();
         const sessionDir = path.join(process.cwd(), 'storage', 'sessions', 'baileys', wabaId.toString());
 
-        if (this.sockets.has(wabaId.toString())) {
-            const existingSock = this.sockets.get(wabaId.toString());
+        if (this.sockets.has(socketKey)) {
+            const existingSock = this.sockets.get(socketKey);
 
             // A closed Baileys socket can remain in memory with an old database
             // status. Reuse it only when WhatsApp has assigned a live user JID.
@@ -68,7 +93,7 @@ export default class BaileysProvider extends BaseProvider {
             }
 
             console.log(`Removing stale socket for WABA ${wabaId} before reconnecting`);
-            this.sockets.delete(wabaId.toString());
+            this.sockets.delete(socketKey);
             try {
                 existingSock?.end?.(new Error('Replacing stale WhatsApp socket'));
             } catch (error) {
@@ -94,17 +119,35 @@ export default class BaileysProvider extends BaseProvider {
                 keys: makeCacheableSignalKeyStore(state.keys, logger)
             },
             logger,
+            browser: ['Ubuntu', 'Chrome', '22.04.4'],
+            markOnlineOnConnect: false,
+            connectTimeoutMs: 60_000,
+            defaultQueryTimeoutMs: 60_000,
+            keepAliveIntervalMs: 15_000,
+            retryRequestDelayMs: 1_000,
+            emitOwnEvents: true,
             getMessage: async (key) => {
                 return { conversation: 'Hello' };
             }
         });
 
-        this.sockets.set(wabaId.toString(), sock);
+        const generation = (this.connectionGenerations.get(socketKey) || 0) + 1;
+        this.connectionGenerations.set(socketKey, generation);
+        this.sockets.set(socketKey, sock);
 
         sock.ev.on('creds.update', saveCreds);
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
+
+            // Events from a superseded socket must never change database status
+            // or remove the newer socket belonging to this WABA.
+            if (this.connectionGenerations.get(socketKey) !== generation || this.sockets.get(socketKey) !== sock) {
+                if (connection || qr) {
+                    console.log(`Ignoring stale connection event for WABA ${wabaId} (generation ${generation})`);
+                }
+                return;
+            }
 
             if (qr) {
 
@@ -127,99 +170,228 @@ export default class BaileysProvider extends BaseProvider {
             }
 
             if (connection === 'close') {
-                const errorCode = (lastDisconnect.error)?.output?.statusCode;
-                const errorMessage = (lastDisconnect.error)?.message || (lastDisconnect.error)?.toString();
-                const isQRTimeout = errorCode === 408 || errorMessage?.includes('QR refs attempts ended');
-                const shouldReconnect = errorCode !== DisconnectReason.loggedOut && !isQRTimeout;
+                // Ignore late close events from an older socket. Without this guard,
+                // an old socket can delete a newer healthy connection from the Map.
+                const currentSocket = this.sockets.get(socketKey);
+                const currentGeneration = this.connectionGenerations.get(socketKey);
+                if (currentGeneration !== generation || (currentSocket && currentSocket !== sock)) {
+                    console.log(`Ignoring stale close event for WABA ${wabaId} (generation ${generation})`);
+                    return;
+                }
 
-                console.log(`Connection closed for WABA ${wabaId}. Error: ${errorMessage} (Code: ${errorCode}), reconnecting: ${shouldReconnect}`);
+                const error = lastDisconnect?.error;
+                const errorCode = error?.output?.statusCode || error?.statusCode || error?.data?.statusCode || null;
+                const errorMessage = error?.message || error?.toString?.() || 'Unknown disconnect';
+                const registeredSession = Boolean(state?.creds?.registered || sock?.user?.id);
+                const qrReferencesEnded = /QR refs attempts ended/i.test(errorMessage);
 
-                this.sockets.delete(wabaId.toString());
+                // 408 means a normal request timeout for an authenticated session.
+                // It is a QR timeout only before the account has been registered.
+                const isQRTimeout = !registeredSession && qrReferencesEnded;
+                const isLoggedOut = errorCode === DisconnectReason.loggedOut || errorCode === 401;
+                const isConnectionReplaced = errorCode === DisconnectReason.connectionReplaced || errorCode === 440;
+                const shouldReconnect = !isLoggedOut && !isQRTimeout && !isConnectionReplaced;
+
+                console.log('[Baileys connection closed]', {
+                    wabaId: socketKey,
+                    phone: extractPhoneNumber(sock, connectionData, state),
+                    errorCode,
+                    errorMessage,
+                    registeredSession,
+                    isQRTimeout,
+                    isLoggedOut,
+                    isConnectionReplaced,
+                    shouldReconnect,
+                    generation
+                });
+
+                if (this.sockets.get(socketKey) === sock) {
+                    this.sockets.delete(socketKey);
+                }
 
                 if (shouldReconnect) {
-                    await delay(5000);
-
-                    const freshData = await WhatsappWaba.findById(wabaId).lean();
-                    await this.initializeConnection(userId, {
-                        ...(freshData || connectionData),
-                        sync_chat: connectionData.sync_chat
-                    });
-                } else {
-                    if (isQRTimeout) {
-                        console.log(`QR timeout for WABA ${wabaId}. Breaking loop.`);
-                    } else {
-                        console.log(`Baileys logged out for WABA ${wabaId}. Cleaning up session and chat history...`);
-                        try {
-                            const phoneDoc = await WhatsappPhoneNumber.findOne({ waba_id: wabaId }).lean();
-                            if (phoneDoc?._id) {
-
-                                const { deletedCount } = await Message.deleteMany({
-                                    user_id: userId,
-                                    whatsapp_phone_number_id: phoneDoc._id
-                                });
-                                console.log(`Deleted ${deletedCount} messages for phone ${phoneDoc.display_phone_number} (WABA ${wabaId}) on logout.`);
-                            }
-                        } catch (delErr) {
-                            console.error(`Error deleting messages on logout for WABA ${wabaId}:`, delErr.message);
-                        }
-                    }
-
                     await WhatsappWaba.findByIdAndUpdate(wabaId, {
-                        connection_status: 'disconnected',
+                        connection_status: 'reconnecting',
                         qr_code: null
                     });
-
-                    if (fs.existsSync(sessionDir)) {
-                        try {
-                            fs.rmSync(sessionDir, { recursive: true, force: true });
-                            console.log(`Deleted session directory: ${sessionDir}`);
-                        } catch (err) {
-                            console.error(`Error deleting session directory: ${err.message}`);
-                        }
-                    }
-
-                    this.emitStatus(wabaId, isQRTimeout ? 'qr_timeout' : 'disconnected', {
+                    this.emitStatus(wabaId, 'reconnecting', {
                         message: errorMessage,
-                        code: errorCode
+                        code: errorCode,
+                        transient: true
                     });
 
+                    if (!this.reconnectTimers.has(socketKey)) {
+                        const attempt = (this.reconnectAttempts.get(socketKey) || 0) + 1;
+                        this.reconnectAttempts.set(socketKey, attempt);
+                        const reconnectDelay = Math.min(3_000 * (2 ** Math.min(attempt - 1, 3)), 30_000);
 
-                    if (!isQRTimeout) {
-                        const checkWaba = await WhatsappWaba.findById(wabaId).lean();
-                        if (checkWaba && !checkWaba.deleted_at) {
-                            console.log(`Regenerating QR code for WABA ${wabaId} after disconnect...`);
-                            setTimeout(() => {
-                                this.initializeConnection(userId, connectionData).catch(err => {
-                                    console.error(`Failed to regenerate QR code for WABA ${wabaId}:`, err);
+                        const timer = setTimeout(async () => {
+                            this.reconnectTimers.delete(socketKey);
+                            try {
+                                const freshData = await WhatsappWaba.findById(wabaId).lean();
+                                if (!freshData || freshData.deleted_at) return;
+                                await this.initializeConnection(userId, {
+                                    ...freshData,
+                                    sync_chat: freshData.sync_chat ?? connectionData.sync_chat
                                 });
-                            }, 5000);
-                        } else {
-                            console.log(`Skipping QR regeneration for WABA ${wabaId} as it is marked for deletion.`);
+                            } catch (reconnectError) {
+                                console.error(`Reconnect failed for WABA ${wabaId}:`, reconnectError.message);
+                                // Schedule another attempt without deleting valid credentials.
+                                const freshData = await WhatsappWaba.findById(wabaId).lean().catch(() => null);
+                                if (freshData && !freshData.deleted_at) {
+                                    this.initializeConnection(userId, freshData).catch(err => {
+                                        console.error(`Follow-up reconnect failed for WABA ${wabaId}:`, err.message);
+                                    });
+                                }
+                            }
+                        }, reconnectDelay);
+                        timer.unref?.();
+                        this.reconnectTimers.set(socketKey, timer);
+                    }
+                    return;
+                }
+
+                this.reconnectAttempts.delete(socketKey);
+                const pendingTimer = this.reconnectTimers.get(socketKey);
+                if (pendingTimer) clearTimeout(pendingTimer);
+                this.reconnectTimers.delete(socketKey);
+
+                if (isConnectionReplaced) {
+                    await WhatsappWaba.findByIdAndUpdate(wabaId, {
+                        connection_status: 'connection_conflict',
+                        qr_code: null
+                    });
+                    this.emitStatus(wabaId, 'connection_conflict', {
+                        message: 'This WhatsApp account was opened by another WAPI connection or server instance.',
+                        code: errorCode
+                    });
+                    console.error(`WABA ${wabaId} was replaced by another session. Remove duplicate connections for the same phone and reconnect once.`);
+                    return;
+                }
+
+                if (isQRTimeout) {
+                    console.log(`QR expired for WABA ${wabaId}; waiting for a fresh QR session.`);
+                } else {
+                    console.log(`Baileys logged out for WABA ${wabaId}. Cleaning up session and chat history...`);
+                    try {
+                        const phoneDoc = await WhatsappPhoneNumber.findOne({ waba_id: wabaId }).lean();
+                        if (phoneDoc?._id) {
+                            const { deletedCount } = await Message.deleteMany({
+                                user_id: userId,
+                                whatsapp_phone_number_id: phoneDoc._id
+                            });
+                            console.log(`Deleted ${deletedCount} messages for phone ${phoneDoc.display_phone_number} (WABA ${wabaId}) on logout.`);
                         }
+                    } catch (delErr) {
+                        console.error(`Error deleting messages on logout for WABA ${wabaId}:`, delErr.message);
+                    }
+                }
+
+                await WhatsappWaba.findByIdAndUpdate(wabaId, {
+                    connection_status: isQRTimeout ? 'qrcode' : 'disconnected',
+                    qr_code: null
+                });
+
+                // Delete credentials only after a real logout or an expired,
+                // never-registered QR. Never delete a valid session for code 408.
+                if ((isLoggedOut || isQRTimeout) && fs.existsSync(sessionDir)) {
+                    try {
+                        fs.rmSync(sessionDir, { recursive: true, force: true });
+                        console.log(`Deleted invalid session directory: ${sessionDir}`);
+                    } catch (err) {
+                        console.error(`Error deleting invalid session directory: ${err.message}`);
+                    }
+                }
+
+                this.emitStatus(wabaId, isQRTimeout ? 'qr_timeout' : 'disconnected', {
+                    message: errorMessage,
+                    code: errorCode
+                });
+
+                if (isLoggedOut) {
+                    const checkWaba = await WhatsappWaba.findById(wabaId).lean();
+                    if (checkWaba && !checkWaba.deleted_at) {
+                        setTimeout(() => {
+                            this.initializeConnection(userId, checkWaba).catch(err => {
+                                console.error(`Failed to generate a new QR for WABA ${wabaId}:`, err.message);
+                            });
+                        }, 3_000).unref?.();
                     }
                 }
             } else if (connection === 'open') {
+                // Ignore an open event from a superseded socket.
+                if (this.sockets.get(socketKey) !== sock || this.connectionGenerations.get(socketKey) !== generation) {
+                    console.log(`Ignoring stale open event for WABA ${wabaId} (generation ${generation})`);
+                    return;
+                }
+
+                const pendingTimer = this.reconnectTimers.get(socketKey);
+                if (pendingTimer) clearTimeout(pendingTimer);
+                this.reconnectTimers.delete(socketKey);
+                this.reconnectAttempts.delete(socketKey);
+
                 console.log(`Baileys connection opened for WABA ${wabaId}`);
-                const userJid = sock.user.id;
-                const phoneNumber = userJid.split(':')[0].split('@')[0];
+                const userJid = String(sock.user?.id || state?.creds?.me?.id || '');
+                const phoneNumber = extractPhoneNumber(sock, connectionData, state);
+
+                if (!phoneNumber) {
+                    console.warn(`Could not resolve the phone number for WABA ${wabaId}. User JID: ${userJid}`);
+                }
+
+                // Only one live WAPI connection may own a WhatsApp number. Clean up
+                // duplicate WABA records so two sockets do not replace each other.
+                if (phoneNumber) {
+                    const duplicatePhones = await WhatsappPhoneNumber.find({
+                        display_phone_number: phoneNumber,
+                        waba_id: { $ne: wabaId },
+                        is_active: true
+                    }).lean();
+
+                    for (const duplicate of duplicatePhones) {
+                        const duplicateWabaId = duplicate.waba_id?.toString();
+                        if (!duplicateWabaId) continue;
+
+                        const duplicateSocket = this.sockets.get(duplicateWabaId);
+                        try {
+                            duplicateSocket?.end?.(new Error(`Duplicate WhatsApp number ${phoneNumber}`));
+                        } catch (duplicateError) {
+                            console.warn(`Could not close duplicate WABA ${duplicateWabaId}:`, duplicateError.message);
+                        }
+                        this.sockets.delete(duplicateWabaId);
+
+                        const duplicateTimer = this.reconnectTimers.get(duplicateWabaId);
+                        if (duplicateTimer) clearTimeout(duplicateTimer);
+                        this.reconnectTimers.delete(duplicateWabaId);
+                        this.reconnectAttempts.delete(duplicateWabaId);
+
+                        await WhatsappPhoneNumber.findByIdAndUpdate(duplicate._id, { is_active: false });
+                        await WhatsappWaba.findByIdAndUpdate(duplicate.waba_id, {
+                            connection_status: 'duplicate_disconnected',
+                            qr_code: null
+                        });
+                        this.emitStatus(duplicate.waba_id, 'duplicate_disconnected', {
+                            phone_number: phoneNumber,
+                            replaced_by_waba_id: socketKey
+                        });
+                    }
+                }
 
                 await WhatsappWaba.findByIdAndUpdate(wabaId, {
                     connection_status: 'connected',
                     qr_code: null,
-                    display_phone_number: phoneNumber,
-                    registred_phone_number: phoneNumber
+                    ...(phoneNumber ? {
+                        display_phone_number: phoneNumber,
+                        registred_phone_number: phoneNumber
+                    } : {})
                 });
 
-                // Reconnecting the same WABA with another phone previously left
-                // the old phone-number record unchanged. Always synchronize it
-                // with the account that is actually linked to this live socket.
                 await WhatsappPhoneNumber.findOneAndUpdate(
                     { waba_id: wabaId },
                     {
                         $set: {
                             user_id: userId,
                             phone_number_id: userJid,
-                            display_phone_number: phoneNumber,
+                            ...(phoneNumber ? { display_phone_number: phoneNumber } : {}),
                             is_active: true
                         }
                     },
@@ -228,7 +400,8 @@ export default class BaileysProvider extends BaseProvider {
 
                 this.emitStatus(wabaId, 'connected', {
                     phone_number: phoneNumber,
-                    verified_live_socket: true
+                    verified_live_socket: true,
+                    generation
                 });
             }
         });
@@ -763,7 +936,7 @@ export default class BaileysProvider extends BaseProvider {
         }
 
 
-        const liveSenderNumber = String(sock.user?.id || '').split(':')[0].split('@')[0] || null;
+        const liveSenderNumber = extractPhoneNumber(sock, connection, null);
         let phoneRecord = await WhatsappPhoneNumber.findOne({ waba_id: wabaId }).lean();
 
         // The live Baileys socket is the source of truth. Repair stale phone
