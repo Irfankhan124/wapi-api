@@ -600,30 +600,45 @@ class UnifiedWhatsAppService {
       connections.map(async (conn) => {
         let verified_name = null;
         let quality_rating = null;
-        console.log("conn.phone_number_id", conn.phone_number_id)
-        console.log("conn.access_token", conn.access_token)
+        // Baileys stores a device JID such as 937xxxxxxxx:20@s.whatsapp.net.
+        // That is not a Meta Cloud API phone-number ID and must never be sent
+        // to graph.facebook.com. Doing so caused repeated HTTP 401 errors and
+        // also exposed access tokens in the server logs.
+        const phoneNumberId = String(conn.phone_number_id || '');
+        const isBaileysJid = phoneNumberId.includes('@s.whatsapp.net')
+          || phoneNumberId.includes('@lid')
+          || phoneNumberId.includes(':');
+        const hasBusinessApiCredentials = !isBaileysJid
+          && /^\d+$/.test(phoneNumberId)
+          && Boolean(conn.access_token);
 
-        try {
-          const response = await axios.get(
-            `https://graph.facebook.com/v19.0/${conn.phone_number_id}`,
-            {
-              params: {
-                fields: 'verified_name,quality_rating'
-              },
-              headers: {
-                Authorization: `Bearer ${conn.access_token}`
+        if (hasBusinessApiCredentials) {
+          try {
+            const response = await axios.get(
+              `https://graph.facebook.com/v19.0/${phoneNumberId}`,
+              {
+                params: {
+                  fields: 'verified_name,quality_rating'
+                },
+                headers: {
+                  Authorization: `Bearer ${conn.access_token}`
+                },
+                timeout: 10_000
               }
-            }
-          );
-          verified_name = response.data.verified_name;
-          quality_rating = response.data.quality_rating;
-        } catch (err) {
-          console.error(
-            `Failed to fetch WhatsApp details for ${conn.phone_number_id}`,
-            err.message
-          );
+            );
+            verified_name = response.data.verified_name;
+            quality_rating = response.data.quality_rating;
+          } catch (err) {
+            console.warn(
+              `Could not refresh Meta WhatsApp details for phone-number ID ${phoneNumberId}:`,
+              err.response?.status || err.message
+            );
+          }
+        } else if (isBaileysJid) {
+          // Use local connection information for Baileys records.
+          verified_name = conn.name || conn.registred_phone_number || phoneNumberId.split(':')[0];
+          quality_rating = null;
         }
-
         return {
           id: conn._id.toString(),
           name: conn.name,

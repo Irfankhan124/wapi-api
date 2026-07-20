@@ -55,6 +55,10 @@ export default class BaileysProvider extends BaseProvider {
         this.reconnectTimers = new Map();
         this.reconnectAttempts = new Map();
         this.connectionGenerations = new Map();
+        // Track sockets that are legitimately waiting for QR/connection open.
+        // A Baileys socket has no sock.user until authentication completes, so
+        // sock.user alone must never be used to decide that the socket is stale.
+        this.socketStates = new Map();
         this.io = null;
     }
 
@@ -83,23 +87,33 @@ export default class BaileysProvider extends BaseProvider {
 
         if (this.sockets.has(socketKey)) {
             const existingSock = this.sockets.get(socketKey);
+            const existingState = this.socketStates.get(socketKey);
 
-            // A closed Baileys socket can remain in memory with an old database
-            // status. Reuse it only when WhatsApp has assigned a live user JID.
             if (existingSock?.user?.id) {
                 const activePhone = String(existingSock.user.id).split(':')[0].split('@')[0];
                 console.log(`Live socket already active for WABA ${wabaId} (${activePhone})`);
                 return { success: true, status: 'active', phone_number: activePhone };
             }
 
-            console.log(`Removing stale socket for WABA ${wabaId} before reconnecting`);
+            // During QR display and the first connection handshake sock.user is
+            // intentionally empty. QR polling used to mistake that valid socket
+            // for a stale one and replace it every ~50 seconds.
+            if (['starting', 'connecting', 'qrcode', 'restarting'].includes(existingState)) {
+                console.log(`Connection already ${existingState} for WABA ${wabaId}; reusing generation ${this.connectionGenerations.get(socketKey) || 0}`);
+                return { success: true, status: existingState };
+            }
+
+            console.log(`Removing genuinely stale socket for WABA ${wabaId} (state: ${existingState || 'unknown'})`);
             this.sockets.delete(socketKey);
+            this.socketStates.delete(socketKey);
             try {
                 existingSock?.end?.(new Error('Replacing stale WhatsApp socket'));
             } catch (error) {
                 console.warn(`Could not close stale socket for WABA ${wabaId}:`, error.message);
             }
         }
+
+        this.socketStates.set(socketKey, 'starting');
 
         if (!fs.existsSync(sessionDir)) {
             fs.mkdirSync(sessionDir, { recursive: true });
@@ -134,8 +148,21 @@ export default class BaileysProvider extends BaseProvider {
         const generation = (this.connectionGenerations.get(socketKey) || 0) + 1;
         this.connectionGenerations.set(socketKey, generation);
         this.sockets.set(socketKey, sock);
+        this.socketStates.set(socketKey, 'connecting');
 
-        sock.ev.on('creds.update', saveCreds);
+        // Persist every credential update serially. Code 515 is WhatsApp asking
+        // the client to restart immediately after pairing; reconnecting before
+        // creds.json is flushed can lose the freshly paired session and show a
+        // new QR again.
+        let credentialsSaveChain = Promise.resolve();
+        sock.ev.on('creds.update', () => {
+            credentialsSaveChain = credentialsSaveChain.then(
+                () => saveCreds(),
+                () => saveCreds()
+            ).catch((saveError) => {
+                console.error(`Failed to save Baileys credentials for WABA ${wabaId}:`, saveError.message);
+            });
+        });
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
@@ -150,6 +177,7 @@ export default class BaileysProvider extends BaseProvider {
             }
 
             if (qr) {
+                this.socketStates.set(socketKey, 'qrcode');
 
                 const waba = await WhatsappWaba.findById(wabaId);
 
@@ -192,6 +220,8 @@ export default class BaileysProvider extends BaseProvider {
                 const isConnectionReplaced = errorCode === DisconnectReason.connectionReplaced || errorCode === 440;
                 const shouldReconnect = !isLoggedOut && !isQRTimeout && !isConnectionReplaced;
 
+                this.socketStates.set(socketKey, errorCode === 515 ? 'restarting' : 'closed');
+
                 console.log('[Baileys connection closed]', {
                     wabaId: socketKey,
                     phone: extractPhoneNumber(sock, connectionData, state),
@@ -204,6 +234,11 @@ export default class BaileysProvider extends BaseProvider {
                     shouldReconnect,
                     generation
                 });
+
+                // Make sure the pairing credentials are physically written before
+                // replacing a code-515 socket with the restarted connection.
+                await credentialsSaveChain.catch(() => {});
+                if (errorCode === 515) await delay(500);
 
                 if (this.sockets.get(socketKey) === sock) {
                     this.sockets.delete(socketKey);
@@ -223,7 +258,12 @@ export default class BaileysProvider extends BaseProvider {
                     if (!this.reconnectTimers.has(socketKey)) {
                         const attempt = (this.reconnectAttempts.get(socketKey) || 0) + 1;
                         this.reconnectAttempts.set(socketKey, attempt);
-                        const reconnectDelay = Math.min(3_000 * (2 ** Math.min(attempt - 1, 3)), 30_000);
+                        // 515 is the expected post-QR restart, not a failure. Restart
+                        // quickly after credentials have been saved; use backoff for
+                        // ordinary network disconnects.
+                        const reconnectDelay = errorCode === 515
+                            ? 750
+                            : Math.min(3_000 * (2 ** Math.min(attempt - 1, 3)), 30_000);
 
                         const timer = setTimeout(async () => {
                             this.reconnectTimers.delete(socketKey);
@@ -251,6 +291,7 @@ export default class BaileysProvider extends BaseProvider {
                     return;
                 }
 
+                this.socketStates.delete(socketKey);
                 this.reconnectAttempts.delete(socketKey);
                 const pendingTimer = this.reconnectTimers.get(socketKey);
                 if (pendingTimer) clearTimeout(pendingTimer);
@@ -329,6 +370,9 @@ export default class BaileysProvider extends BaseProvider {
                 if (pendingTimer) clearTimeout(pendingTimer);
                 this.reconnectTimers.delete(socketKey);
                 this.reconnectAttempts.delete(socketKey);
+
+                this.socketStates.set(socketKey, 'connected');
+                await credentialsSaveChain.catch(() => {});
 
                 console.log(`Baileys connection opened for WABA ${wabaId}`);
                 const userJid = String(sock.user?.id || state?.creds?.me?.id || '');
