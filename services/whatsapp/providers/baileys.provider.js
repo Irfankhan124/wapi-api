@@ -58,12 +58,22 @@ export default class BaileysProvider extends BaseProvider {
 
         if (this.sockets.has(wabaId.toString())) {
             const existingSock = this.sockets.get(wabaId.toString());
-            if (connectionData.connection_status === 'qrcode' || connectionData.qr_code) {
-                console.log(`Socket already active and QR generated for WABA ${wabaId}`);
-                return { success: true, status: 'qrcode' };
+
+            // A closed Baileys socket can remain in memory with an old database
+            // status. Reuse it only when WhatsApp has assigned a live user JID.
+            if (existingSock?.user?.id) {
+                const activePhone = String(existingSock.user.id).split(':')[0].split('@')[0];
+                console.log(`Live socket already active for WABA ${wabaId} (${activePhone})`);
+                return { success: true, status: 'active', phone_number: activePhone };
             }
-            console.log(`Socket already active for WABA ${wabaId}`);
-            return { success: true, status: 'active' };
+
+            console.log(`Removing stale socket for WABA ${wabaId} before reconnecting`);
+            this.sockets.delete(wabaId.toString());
+            try {
+                existingSock?.end?.(new Error('Replacing stale WhatsApp socket'));
+            } catch (error) {
+                console.warn(`Could not close stale socket for WABA ${wabaId}:`, error.message);
+            }
         }
 
         if (!fs.existsSync(sessionDir)) {
@@ -196,20 +206,30 @@ export default class BaileysProvider extends BaseProvider {
                 await WhatsappWaba.findByIdAndUpdate(wabaId, {
                     connection_status: 'connected',
                     qr_code: null,
+                    display_phone_number: phoneNumber,
+                    registred_phone_number: phoneNumber
                 });
 
-                this.emitStatus(wabaId, 'connected', { phone_number: phoneNumber });
+                // Reconnecting the same WABA with another phone previously left
+                // the old phone-number record unchanged. Always synchronize it
+                // with the account that is actually linked to this live socket.
+                await WhatsappPhoneNumber.findOneAndUpdate(
+                    { waba_id: wabaId },
+                    {
+                        $set: {
+                            user_id: userId,
+                            phone_number_id: userJid,
+                            display_phone_number: phoneNumber,
+                            is_active: true
+                        }
+                    },
+                    { upsert: true, new: true, setDefaultsOnInsert: true }
+                );
 
-                let phone = await WhatsappPhoneNumber.findOne({ waba_id: wabaId });
-                if (!phone) {
-                    await WhatsappPhoneNumber.create({
-                        user_id: userId,
-                        waba_id: wabaId,
-                        phone_number_id: userJid,
-                        display_phone_number: phoneNumber,
-                        is_active: true
-                    });
-                }
+                this.emitStatus(wabaId, 'connected', {
+                    phone_number: phoneNumber,
+                    verified_live_socket: true
+                });
             }
         });
 
@@ -649,18 +669,41 @@ export default class BaileysProvider extends BaseProvider {
             throw new Error(`Invalid recipient phone number: ${recipientNumber}`);
         }
 
-        // Verify the number exists on WhatsApp before claiming the message was sent.
-        const lookup = typeof sock.onWhatsApp === 'function'
-            ? await sock.onWhatsApp(cleanRecipient)
+        // Baileys expects a WhatsApp JID. Passing only digits can produce an
+        // ambiguous lookup for some accounts, especially after LID migration.
+        const requestedJid = `${cleanRecipient}@s.whatsapp.net`;
+        let lookup = null;
+        if (typeof sock.onWhatsApp === 'function') {
+            lookup = await sock.onWhatsApp(requestedJid);
+
+            // Compatibility fallback for Baileys versions that normalize digits.
+            if (!Array.isArray(lookup) || !lookup.some(item => item?.exists === true && item?.jid)) {
+                const fallbackLookup = await sock.onWhatsApp(cleanRecipient);
+                if (Array.isArray(fallbackLookup) && fallbackLookup.length > 0) {
+                    lookup = fallbackLookup;
+                }
+            }
+        }
+
+        const target = Array.isArray(lookup)
+            ? lookup.find(item => item?.exists === true && item?.jid)
             : null;
-        const target = Array.isArray(lookup) ? lookup.find(item => item?.exists) : null;
-        if (Array.isArray(lookup) && !target) {
-            throw new Error(`The number ${cleanRecipient} is not registered on WhatsApp`);
+
+        console.log('[Baileys recipient verification]', {
+            wabaId: socketKey,
+            sender: String(sock.user?.id || '').split(':')[0].split('@')[0] || null,
+            recipient: cleanRecipient,
+            requestedJid,
+            lookup
+        });
+
+        if (!target?.jid) {
+            throw new Error(`The number +${cleanRecipient} is not registered or could not be verified on WhatsApp`);
         }
 
         console.log(`Baileys sending message to ${cleanRecipient}: type=${messageTypeInput}, mediaUrl=${mediaUrl}`);
         const messageType = messageTypeInput || (mediaUrl ? this.getMediaTypeFromUrl(mediaUrl) : 'text');
-        const jid = target?.jid || `${cleanRecipient}@s.whatsapp.net`;
+        const jid = target.jid;
 
         let result;
         const isUrl = mediaUrl && mediaUrl.startsWith('http');
@@ -720,9 +763,35 @@ export default class BaileysProvider extends BaseProvider {
         }
 
 
-        const phoneRecord = await WhatsappPhoneNumber.findOne({ waba_id: wabaId }).lean();
-        const myNumber = phoneRecord?.display_phone_number || connection.display_phone_number || connection.registred_phone_number;
-        const contact = await Contact.findOne({ phone_number: recipientNumber, created_by: userId });
+        const liveSenderNumber = String(sock.user?.id || '').split(':')[0].split('@')[0] || null;
+        let phoneRecord = await WhatsappPhoneNumber.findOne({ waba_id: wabaId }).lean();
+
+        // The live Baileys socket is the source of truth. Repair stale phone
+        // metadata so the API never reports a different sender than the account
+        // that actually submitted the message.
+        if (liveSenderNumber && phoneRecord?.display_phone_number !== liveSenderNumber) {
+            phoneRecord = await WhatsappPhoneNumber.findOneAndUpdate(
+                { waba_id: wabaId },
+                {
+                    $set: {
+                        user_id: userId,
+                        phone_number_id: sock.user.id,
+                        display_phone_number: liveSenderNumber,
+                        is_active: true
+                    }
+                },
+                { upsert: true, new: true, setDefaultsOnInsert: true }
+            ).lean();
+
+            await WhatsappWaba.findByIdAndUpdate(wabaId, {
+                display_phone_number: liveSenderNumber,
+                registred_phone_number: liveSenderNumber,
+                connection_status: 'connected'
+            });
+        }
+
+        const myNumber = liveSenderNumber || phoneRecord?.display_phone_number || connection.display_phone_number || connection.registred_phone_number;
+        const contact = await Contact.findOne({ phone_number: cleanRecipient, created_by: userId });
 
         const waMessageId = result?.key?.id || result?.message?.key?.id;
         if (!waMessageId) {
@@ -731,7 +800,7 @@ export default class BaileysProvider extends BaseProvider {
 
         const savedMessage = await Message.create({
             sender_number: myNumber,
-            recipient_number: recipientNumber,
+            recipient_number: cleanRecipient,
             user_id: userId,
             contact_id: contact?._id,
             whatsapp_phone_number_id: phoneRecord?._id || null,
@@ -757,7 +826,14 @@ export default class BaileysProvider extends BaseProvider {
             id: savedMessage._id,
             messageId: savedMessage._id,
             waMessageId,
-            status: 'sent'
+            status: 'sent',
+            submission_status: 'submitted',
+            recipient_verified: true,
+            sender_number: myNumber,
+            recipient_number: cleanRecipient,
+            jid,
+            is_delivered: false,
+            is_seen: false
         };
     }
 
