@@ -396,82 +396,59 @@ export const sendMessage = async (req, res) => {
       templateId: templateIdInput || undefined
     });
 
-    const messageId = result.id || result.messageId;
-    const waMessageId =
-      result.waMessageId ||
-      result.wa_message_id ||
-      result?.key?.id ||
-      result?.message?.key?.id ||
-      null;
+    let messageId = result.id || result.messageId;
 
-    if (!waMessageId) {
-      return res.status(502).json({
-        success: false,
-        error: 'WhatsApp did not confirm message submission',
-        details: 'The provider returned no real WhatsApp message ID.',
+    if (!messageId) {
+      return res.json({
+        success: true,
+        message: 'Message sent successfully',
         data: result
       });
     }
 
-    const savedMessage = messageId ? await Message.findById(messageId).lean() : null;
-    const formattedResponse = savedMessage
-      ? {
-        id: savedMessage._id.toString(),
-        sender_number: savedMessage.sender_number,
-        recipient_number: savedMessage.recipient_number,
-        content: savedMessage.content,
-        message_type: savedMessage.message_type,
-        file_url: savedMessage.file_url,
-        file_type: savedMessage.file_type,
-        wa_jid: savedMessage.wa_jid,
-        from_me: savedMessage.from_me,
-        direction: savedMessage.direction,
-        wa_message_id: savedMessage.wa_message_id || waMessageId,
-        wa_timestamp: savedMessage.wa_timestamp,
-        is_delivered: savedMessage.is_delivered,
-        is_seen: savedMessage.is_seen,
-        provider: savedMessage.provider,
-        reply_message_id: savedMessage.reply_message_id,
-        reaction_message_id: savedMessage.reaction_message_id,
-        recipient_verified: result.recipient_verified !== false,
-        status: result.status || 'sent',
-        created_at: savedMessage.created_at || savedMessage.createdAt,
-        updated_at: savedMessage.updated_at || savedMessage.updatedAt
-      }
-      : {
-        ...result,
-        wa_message_id: waMessageId,
-        recipient_verified: result.recipient_verified !== false,
-        status: result.status || 'sent'
-      };
+    const savedMessage = await Message.findById(messageId).lean();
+
+    if (!savedMessage) {
+      return res.json({
+        success: true,
+        message: 'Message sent successfully',
+        data: result
+      });
+    }
+
+    const formattedResponse = {
+      id: savedMessage._id.toString(),
+      sender_number: savedMessage.sender_number,
+      recipient_number: savedMessage.recipient_number,
+      content: savedMessage.content,
+      message_type: savedMessage.message_type,
+      file_url: savedMessage.file_url,
+      file_type: savedMessage.file_type,
+      wa_jid: savedMessage.wa_jid,
+      from_me: savedMessage.from_me,
+      direction: savedMessage.direction,
+      wa_message_id: savedMessage.wa_message_id,
+      wa_timestamp: savedMessage.wa_timestamp,
+      is_delivered: savedMessage.is_delivered,
+      is_seen: savedMessage.is_seen,
+      provider: savedMessage.provider,
+      reply_message_id: savedMessage.reply_message_id,
+      reaction_message_id: savedMessage.reaction_message_id,
+      created_at: savedMessage.created_at,
+      updated_at: savedMessage.updated_at
+    };
 
     return res.json({
       success: true,
-      message: 'Message submitted to WhatsApp',
-      status: result.status || 'sent',
-      wa_message_id: waMessageId,
-      recipient_verified: result.recipient_verified !== false,
+      message: 'Message sent successfully',
       data: formattedResponse
     });
   } catch (error) {
     console.error('Error sending message:', error);
-    const details = String(error?.message || 'Failed to send message');
-    const normalized = details.toLowerCase();
-    const statusCode =
-      normalized.includes('not actually connected') || normalized.includes('reconnect by qr')
-        ? 409
-        : normalized.includes('not registered') || normalized.includes('could not be verified')
-          ? 422
-          : normalized.includes('invalid recipient') || normalized.includes('required')
-            ? 400
-            : 500;
-
-    return res.status(statusCode).json({
+    return res.status(500).json({
       success: false,
-      error: details,
-      details,
-      connection_error: statusCode === 409,
-      recipient_verified: statusCode === 422 ? false : undefined
+      error: 'Failed to send message',
+      details: error.message
     });
   }
 };
@@ -1427,68 +1404,47 @@ export const getRecentChats = async (req, res) => {
 export const getConnectionStatus = async (req, res) => {
   try {
     const userId = req.user.owner_id;
-    const {
-      provider = null,
-      whatsapp_phone_number_id: whatsappPhoneNumberId,
-      connection_id: connectionId
-    } = req.query;
+    const { provider, whatsapp_phone_number_id: whatsappPhoneNumberId } = req.query;
 
-    let waba = null;
-    let phoneNumber = null;
+    const providerType = provider || null;
 
-    if (connectionId) {
-      waba = await WhatsappWaba.findOne({
-        _id: connectionId,
-        user_id: userId,
-        deleted_at: null
-      });
-    } else if (whatsappPhoneNumberId) {
-      phoneNumber = await WhatsappPhoneNumber.findOne({
-        _id: whatsappPhoneNumberId,
-        user_id: userId,
-        deleted_at: null
-      }).populate('waba_id');
-      waba = phoneNumber?.waba_id || null;
-    } else {
-      waba = await WhatsappWaba.findOne({
+    if (!whatsappPhoneNumberId) {
+      const firstPhoneNumber = await WhatsappPhoneNumber.findOne({
         user_id: userId,
         is_active: true,
-        deleted_at: null,
-        ...(provider ? { provider } : {})
-      }).sort({ updatedAt: -1, createdAt: -1, _id: -1 });
-    }
+        deleted_at: null
+      })
+        .populate('waba_id')
+        .lean();
 
-    if (!waba) {
-      return res.status(200).json({
+      if (!firstPhoneNumber || !firstPhoneNumber.waba_id) {
+        return res.status(200).json({
+          success: true,
+          connected: false
+        });
+      }
+
+      return res.json({
         success: true,
-        connected: false,
-        status: 'not_configured',
-        runtime_state: 'missing'
+        connected: true,
+
       });
     }
 
-    const providerType = waba.provider || provider || PROVIDER_TYPES.BUSINESS_API;
-    const runtime = await unifiedWhatsAppService.getConnectionStatus(
-      userId,
-      providerType,
-      waba._id.toString()
-    );
+    const whatsappPhoneNumber = await WhatsappPhoneNumber.findById(whatsappPhoneNumberId)
+      .populate('waba_id')
+      .lean();
+
+    if (!whatsappPhoneNumber || !whatsappPhoneNumber.waba_id) {
+      return res.status(404).json({
+        success: false,
+        error: 'WhatsApp Phone Number not found'
+      });
+    }
 
     return res.json({
       success: true,
-      connected: runtime.connected === true,
-      status: runtime.status || waba.connection_status || 'unknown',
-      stored_status: waba.connection_status || null,
-      runtime_state: runtime.runtime_state || null,
-      verified_live_socket: runtime.verified_live_socket === true,
-      connection_id: waba._id.toString(),
-      provider: providerType,
-      display_phone_number:
-        runtime.phone_number ||
-        phoneNumber?.display_phone_number ||
-        waba.display_phone_number ||
-        waba.registred_phone_number ||
-        null
+      connected: true,
     });
   } catch (error) {
     console.error('Error getting connection status:', error);
@@ -1591,7 +1547,7 @@ export const connectWhatsApp = async (req, res) => {
       });
     } else if (provider === PROVIDER_TYPES.BAILEY) {
       const { instance_name, name: bodyName, workspace_id } = req.body;
-      const finalInstanceName = String(instance_name || bodyName || '').trim();
+      const finalInstanceName = instance_name || bodyName;
 
       if (!finalInstanceName) {
         return res.status(400).json({
@@ -1600,55 +1556,35 @@ export const connectWhatsApp = async (req, res) => {
         });
       }
 
-      const reusableQuery = {
-        user_id: userId,
-        provider: PROVIDER_TYPES.BAILEY,
-        deleted_at: null,
-        ...(workspace_id ? { workspace_id } : {})
-      };
-
-      // One WAPI account should reuse its existing Baileys record. Repeated
-      // connect requests previously created competing sockets for the same phone,
-      // which produced connection-replaced errors and frequent disconnects.
-      let waba = await WhatsappWaba.findOne(reusableQuery)
-        .sort({ updatedAt: -1, createdAt: -1, _id: -1 });
-      const isNewWaba = !waba;
-
-      if (!waba) {
-        waba = await WhatsappWaba.create({
-          user_id: userId,
-          workspace_id: workspace_id || null,
-          name: finalInstanceName,
-          instance_name: finalInstanceName,
-          provider: PROVIDER_TYPES.BAILEY,
-          connection_status: 'initial',
-          is_active: true,
-          deleted_at: null
-        });
-      } else {
-        waba.name = finalInstanceName;
-        waba.instance_name = finalInstanceName;
-        waba.workspace_id = workspace_id || waba.workspace_id || null;
-        waba.provider = PROVIDER_TYPES.BAILEY;
-        waba.is_active = true;
-        waba.deleted_at = null;
-        await waba.save();
+      if (workspace_id) {
+        const existingWaba = await WhatsappWaba.findOne({ workspace_id });
+        if (existingWaba) {
+          await WhatsappPhoneNumber.deleteMany({ waba_id: existingWaba._id });
+          await WhatsappWaba.deleteOne({ _id: existingWaba._id });
+        }
       }
+
+      let waba = await WhatsappWaba.create({
+        user_id: userId,
+        workspace_id: workspace_id || null,
+        name: finalInstanceName,
+        instance_name: finalInstanceName,
+        provider: PROVIDER_TYPES.BAILEY,
+        connection_status: 'initial',
+        is_active: true
+      });
 
       unifiedWhatsAppService.initializeConnection(userId, PROVIDER_TYPES.BAILEY, waba)
         .catch(err => console.error('Error initializing Baileys in background:', err));
 
       return res.json({
         success: true,
-        message: isNewWaba
-          ? 'Baileys instance created and initializing. Please fetch QR code.'
-          : 'Existing Baileys instance reused and synchronized.',
+        message: 'Baileys instance created and initializing. Please fetch QR code.',
         data: {
           waba_id: waba._id,
           instance_name: waba.instance_name,
           status: waba.connection_status,
-          provider: waba.provider,
-          reused: !isNewWaba
+          provider: waba.provider
         }
       });
     } else {
@@ -1831,7 +1767,7 @@ export const getUserConnections = async (req, res) => {
       user_id: userId,
       deleted_at: null
     })
-      .sort({ updatedAt: -1, createdAt: -1, _id: -1 })
+      .sort({ created_at: -1 })
       .lean();
 
     const enrichedWabas = await Promise.all(
@@ -1841,7 +1777,7 @@ export const getUserConnections = async (req, res) => {
           waba_id: waba._id,
           deleted_at: null
         })
-          .sort({ is_active: -1, is_primary: -1, updatedAt: -1, createdAt: -1, _id: -1 })
+          .sort({ created_at: -1 })
           .lean();
 
         const enrichedPhoneNumbers = await Promise.all(
@@ -1849,28 +1785,25 @@ export const getUserConnections = async (req, res) => {
             let verified_name = phone.verified_name;
             let quality_rating = phone.quality_rating;
 
-            // A Baileys device JID is not a Meta Graph phone-number ID. Calling
-            // graph.facebook.com with it caused misleading 401 errors and slowed
-            // every database status refresh.
-            const isBusinessApi = waba.provider === PROVIDER_TYPES.BUSINESS_API;
-            const graphPhoneId = String(phone.phone_number_id || '');
-            if (isBusinessApi && /^\d+$/.test(graphPhoneId) && waba.access_token) {
-              try {
-                const response = await axios.get(
-                  `https://graph.facebook.com/v22.0/${graphPhoneId}`,
-                  {
-                    params: { fields: 'verified_name,quality_rating' },
-                    headers: { Authorization: `Bearer ${waba.access_token}` }
+            try {
+              const response = await axios.get(
+                `https://graph.facebook.com/v22.0/${phone.phone_number_id}`,
+                {
+                  params: {
+                    fields: 'verified_name,quality_rating'
+                  },
+                  headers: {
+                    Authorization: `Bearer ${waba.access_token}`
                   }
-                );
-                verified_name = response.data.verified_name || verified_name;
-                quality_rating = response.data.quality_rating || quality_rating;
-              } catch (err) {
-                console.error(
-                  `Failed to fetch WhatsApp details for ${graphPhoneId}`,
-                  err.message
-                );
-              }
+                }
+              );
+              verified_name = response.data.verified_name || verified_name;
+              quality_rating = response.data.quality_rating || quality_rating;
+            } catch (err) {
+              console.error(
+                `Failed to fetch WhatsApp details for ${phone.phone_number_id}`,
+                err.message
+              );
             }
 
             return {
@@ -1880,46 +1813,23 @@ export const getUserConnections = async (req, res) => {
               verified_name,
               quality_rating,
               is_active: phone.is_active,
-              is_primary: phone.is_primary,
-              last_used_at: phone.last_used_at || null,
-              created_at: phone.created_at || phone.createdAt || null,
-              updated_at: phone.updated_at || phone.updatedAt || null
+              created_at: phone.created_at,
+              updated_at: phone.updated_at
             };
           })
         );
 
-        const runtime = await unifiedWhatsAppService.getConnectionStatus(
-          userId,
-          waba.provider || PROVIDER_TYPES.BUSINESS_API,
-          waba._id.toString()
-        );
-        const runtimeStatus = runtime.status || waba.connection_status || 'unknown';
-
         return {
           id: waba._id.toString(),
           name: waba.name,
-          instance_name: waba.instance_name || waba.name,
-          provider: waba.provider || PROVIDER_TYPES.BUSINESS_API,
-          connection_status: runtimeStatus,
-          stored_connection_status: waba.connection_status || null,
-          runtime_connected: runtime.connected === true,
-          runtime_state: runtime.runtime_state || null,
-          verified_live_socket: runtime.verified_live_socket === true,
-          display_phone_number:
-            runtime.phone_number ||
-            waba.display_phone_number ||
-            waba.registred_phone_number ||
-            enrichedPhoneNumbers.find((item) => item.is_active)?.display_phone_number ||
-            enrichedPhoneNumbers[0]?.display_phone_number ||
-            null,
           whatsapp_business_account_id: waba.whatsapp_business_account_id,
           app_id: waba.app_id,
           access_token: waba.access_token ? '***' : null,
           is_active: waba.is_active,
           phone_numbers: enrichedPhoneNumbers,
           phone_numbers_count: enrichedPhoneNumbers.length,
-          created_at: waba.created_at || waba.createdAt || null,
-          updated_at: waba.updated_at || waba.updatedAt || null
+          created_at: waba.created_at,
+          updated_at: waba.updated_at
         };
       })
     );
@@ -1927,8 +1837,7 @@ export const getUserConnections = async (req, res) => {
     return res.json({
       success: true,
       data: enrichedWabas,
-      total_wabas: enrichedWabas.length,
-      checked_at: new Date().toISOString()
+      total_wabas: enrichedWabas.length
     });
   } catch (error) {
     console.error('Error getting user connections:', error);
@@ -2508,9 +2417,6 @@ export const getBaileysQRCode = async (req, res) => {
     const userId = req.user.owner_id;
     const { wabaId } = req.params;
     const syncChat = req.query.sync_chat === 'true';
-    const forceReconnect =
-      req.query.force_reconnect === 'true' ||
-      req.query.force === 'true';
 
     if (!wabaId) {
       return res.status(400).json({
@@ -2519,118 +2425,49 @@ export const getBaileysQRCode = async (req, res) => {
       });
     }
 
-    let waba = await WhatsappWaba.findOne({
-      _id: wabaId,
-      user_id: userId,
-      deleted_at: null
-    });
-
-    if (!waba) {
-      return res.status(404).json({ success: false, error: 'WABA not found' });
-    }
-
     let qrData;
     try {
       qrData = await unifiedWhatsAppService.getQRCode(userId, wabaId);
     } catch (qrErr) {
-      qrData = {
-        success: true,
-        qr_code: null,
-        status: waba.connection_status || 'initial'
-      };
-    }
-
-    const normalizedStatus = String(
-      qrData?.status || waba.connection_status || 'initial'
-    ).trim().toLowerCase().replace(/[\s-]+/g, '_');
-
-    const recoveryStatuses = new Set([
-      'duplicate_disconnected',
-      'duplicate',
-      'duplicate_connection',
-      'connection_conflict'
-    ]);
-
-    // Status polling never destroys a healthy session. A fresh-session reset is
-    // performed only after an explicit force request, or for a known conflict
-    // state that cannot produce a usable QR on its own.
-    if (
-      !qrData?.qr_code &&
-      normalizedStatus !== 'connected' &&
-      (forceReconnect || recoveryStatuses.has(normalizedStatus))
-    ) {
-      const providerInstance = unifiedWhatsAppService.providers?.[PROVIDER_TYPES.BAILEY];
-
-      if (typeof providerInstance?.resetConnectionSession === 'function') {
-        await providerInstance.resetConnectionSession(wabaId, { deleteSession: true });
-      } else {
-        await WhatsappWaba.findByIdAndUpdate(wabaId, {
-          is_active: true,
-          deleted_at: null,
-          connection_status: 'initial',
-          qr_code: null
-        });
+      const waba = await WhatsappWaba.findOne({ _id: wabaId, user_id: userId, deleted_at: null }).lean();
+      if (!waba) {
+        return res.status(404).json({ success: false, error: 'WABA not found' });
       }
-
-      await WhatsappPhoneNumber.updateMany(
-        { waba_id: wabaId },
-        { $set: { is_active: false } }
-      );
-
-      waba = await WhatsappWaba.findById(wabaId);
+      console.log(`QR requested for disconnected WABA ${wabaId}, triggering initialization... (sync_chat=${syncChat})`);
       unifiedWhatsAppService
-        .initializeConnection(userId, PROVIDER_TYPES.BAILEY, {
-          ...waba.toObject(),
-          sync_chat: syncChat
-        })
-        .catch((err) =>
-          console.error(`Failed to start fresh Baileys QR for WABA ${wabaId}:`, err)
-        );
-
+        .initializeConnection(userId, 'baileys', { ...waba, sync_chat: syncChat })
+        .catch(err => console.error(`Failed to init Baileys QR for WABA ${wabaId}:`, err));
       return res.json({
         success: true,
-        data: {
-          success: true,
-          qr_code: null,
-          status: 'generating',
-          recovery_started: true
-        }
+        data: { success: true, qr_code: null, status: 'generating' }
       });
     }
 
-    const needsInit =
-      !qrData?.qr_code &&
-      ['disconnected', 'qr_timeout', 'initial', 'generating', 'reconnecting'].includes(
-        normalizedStatus
-      );
+    const needsInit = !qrData.qr_code &&
+      ['disconnected', 'qr_timeout', 'initial'].includes(qrData.status);
 
     if (needsInit) {
-      await WhatsappWaba.findByIdAndUpdate(wabaId, {
-        is_active: true,
-        deleted_at: null,
-        connection_status:
-          normalizedStatus === 'reconnecting' ? 'reconnecting' : 'initial',
-        qr_code: null
+      const waba = await WhatsappWaba.findOne({
+        _id: wabaId,
+        user_id: userId,
+        deleted_at: null
       });
 
-      waba = await WhatsappWaba.findById(wabaId);
-      unifiedWhatsAppService
-        .initializeConnection(userId, PROVIDER_TYPES.BAILEY, {
-          ...waba.toObject(),
-          sync_chat: syncChat
-        })
-        .catch((err) =>
-          console.error(`Failed to initialize Baileys QR for WABA ${wabaId}:`, err)
-        );
+      if (waba) {
+        console.log(`QR requested for disconnected WABA ${wabaId}, triggering initialization... (sync_chat=${syncChat})`);
+        unifiedWhatsAppService
+          .initializeConnection(userId, 'baileys', { ...waba.toObject(), sync_chat: syncChat })
+          .catch(err => console.error(`Failed to init Baileys QR for WABA ${wabaId}:`, err));
 
-      return res.json({
-        success: true,
-        data: {
+        return res.json({
           success: true,
-          qr_code: null,
-          status: 'generating'
-        }
-      });
+          data: {
+            success: true,
+            qr_code: null,
+            status: 'generating'
+          }
+        });
+      }
     }
 
     return res.json({
@@ -2649,7 +2486,7 @@ export const getBaileysQRCode = async (req, res) => {
 
 export const disconnectWhatsApp = async (req, res) => {
   try {
-    const userId = req.user.owner_id;
+    const userId = req.user.id;
     const { provider, waba_id } = req.body;
 
     await unifiedWhatsAppService.disconnectWhatsApp(userId, provider, waba_id);
@@ -2670,7 +2507,7 @@ export const disconnectWhatsApp = async (req, res) => {
 
 export const getWabaList = async (req, res) => {
   try {
-    const userId = req.user.owner_id;
+    const userId = req.user.id;
 
     const wabas = await WhatsappWaba.find({
       user_id: userId,

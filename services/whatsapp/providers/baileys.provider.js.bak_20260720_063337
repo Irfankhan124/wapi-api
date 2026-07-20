@@ -9,7 +9,7 @@ import makeWASocket, {
 import QRCode from 'qrcode';
 import fs from 'fs';
 import path from 'path';
-import { getBaileysSessionDir } from '../../../utils/baileys-session-path.js';
+import { fileURLToPath } from 'url';
 import BaseProvider from './base.provider.js';
 import { WhatsappWaba, Message, Contact, WhatsappPhoneNumber, WabaConfiguration } from '../../../models/index.js';
 import pino from 'pino';
@@ -24,6 +24,9 @@ import {
 } from '../../../utils/automated-response.service.js';
 
 const logger = pino({ level: process.env.BAILEYS_LOG_LEVEL || 'warn' });
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 
 const digitsOnly = (value) => String(value || '').replace(/\D/g, '');
 
@@ -75,56 +78,12 @@ export default class BaileysProvider extends BaseProvider {
         }
     }
 
-    async resetConnectionSession(wabaId, options = {}) {
-        const socketKey = String(wabaId || '');
-        if (!socketKey) throw new Error('WABA ID is required');
-
-        const deleteSession = options.deleteSession !== false;
-        const socket = this.sockets.get(socketKey);
-
-        const timer = this.reconnectTimers.get(socketKey);
-        if (timer) clearTimeout(timer);
-        this.reconnectTimers.delete(socketKey);
-        this.reconnectAttempts.delete(socketKey);
-
-        // Invalidate every late event from the old socket before closing it.
-        this.connectionGenerations.set(
-            socketKey,
-            (this.connectionGenerations.get(socketKey) || 0) + 1
-        );
-        this.sockets.delete(socketKey);
-        this.socketStates.delete(socketKey);
-
-        try {
-            socket?.end?.(new Error('Resetting WhatsApp connection for a fresh QR'));
-        } catch (error) {
-            console.warn(`Could not close WABA ${socketKey} before QR reset:`, error.message);
-        }
-
-        if (deleteSession) {
-            const sessionDir = getBaileysSessionDir(socketKey);
-            if (fs.existsSync(sessionDir)) {
-                fs.rmSync(sessionDir, { recursive: true, force: true });
-                console.log(`Removed stale Baileys session for WABA ${socketKey}`);
-            }
-        }
-
-        await WhatsappWaba.findByIdAndUpdate(wabaId, {
-            is_active: true,
-            deleted_at: null,
-            connection_status: 'initial',
-            qr_code: null
-        });
-
-        return { success: true, status: 'initial' };
-    }
-
     async initializeConnection(userId, connectionData = null) {
         const wabaId = connectionData?._id || connectionData?.id;
         if (!wabaId) throw new Error('WABA ID is required for Baileys initialization');
 
         const socketKey = wabaId.toString();
-        const sessionDir = getBaileysSessionDir(wabaId);
+        const sessionDir = path.join(process.cwd(), 'storage', 'sessions', 'baileys', wabaId.toString());
 
         if (this.sockets.has(socketKey)) {
             const existingSock = this.sockets.get(socketKey);
@@ -463,7 +422,13 @@ export default class BaileysProvider extends BaseProvider {
                             qr_code: null
                         });
 
-                        const duplicateSessionDir = getBaileysSessionDir(duplicateWabaId);
+                        const duplicateSessionDir = path.join(
+                            process.cwd(),
+                            'storage',
+                            'sessions',
+                            'baileys',
+                            duplicateWabaId
+                        );
                         if (fs.existsSync(duplicateSessionDir)) {
                             try {
                                 fs.rmSync(duplicateSessionDir, { recursive: true, force: true });
@@ -487,30 +452,14 @@ export default class BaileysProvider extends BaseProvider {
                     } : {})
                 });
 
-                const phoneMatch = {
-                    user_id: userId,
-                    $or: [
-                        { waba_id: wabaId },
-                        ...(userJid ? [{ phone_number_id: userJid }] : []),
-                        ...(phoneNumber ? [{ display_phone_number: phoneNumber }] : [])
-                    ]
-                };
-
-                // Reuse the existing phone-number document when the same WhatsApp
-                // account is paired again. Creating a new document can hit the
-                // unique phone_number_id index and leave the dashboard stuck even
-                // though the socket itself opened successfully.
                 await WhatsappPhoneNumber.findOneAndUpdate(
-                    phoneMatch,
+                    { waba_id: wabaId },
                     {
                         $set: {
                             user_id: userId,
-                            waba_id: wabaId,
                             phone_number_id: userJid,
                             ...(phoneNumber ? { display_phone_number: phoneNumber } : {}),
-                            is_active: true,
-                            deleted_at: null,
-                            last_used_at: new Date()
+                            is_active: true
                         }
                     },
                     { upsert: true, new: true, setDefaultsOnInsert: true }
@@ -1138,47 +1087,10 @@ export default class BaileysProvider extends BaseProvider {
     }
 
     async getConnectionStatus(userId, connection = null) {
-        if (!connection) {
-            return { connected: false, status: 'not_configured', runtime_state: 'missing' };
-        }
-
-        const wabaId = String(connection._id || connection.id || '');
-        const sock = this.sockets.get(wabaId);
-        const runtimeState = this.socketStates.get(wabaId) || 'idle';
-        const livePhone = extractPhoneNumber(sock, connection, null);
-        const liveConnected = Boolean(sock?.user?.id && runtimeState === 'connected');
-
-        if (liveConnected) {
-            return {
-                connected: true,
-                status: 'connected',
-                runtime_state: runtimeState,
-                phone_number: livePhone,
-                verified_live_socket: true
-            };
-        }
-
-        const transientStates = new Set(['starting', 'connecting', 'qrcode', 'restarting', 'reconnecting']);
-        if (transientStates.has(runtimeState)) {
-            return {
-                connected: false,
-                status: runtimeState === 'restarting' ? 'reconnecting' : runtimeState,
-                runtime_state: runtimeState,
-                phone_number: livePhone,
-                verified_live_socket: false
-            };
-        }
-
-        const storedStatus = String(connection.connection_status || 'unknown');
+        if (!connection) return { connected: false };
         return {
-            connected: false,
-            // A database value of connected is not enough after a process restart;
-            // only a live authenticated socket is reported as connected.
-            status: storedStatus === 'connected' ? 'reconnecting' : storedStatus,
-            stored_status: storedStatus,
-            runtime_state: runtimeState,
-            phone_number: livePhone,
-            verified_live_socket: false
+            connected: connection.connection_status === 'connected',
+            status: connection.connection_status
         };
     }
 

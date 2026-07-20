@@ -5,11 +5,18 @@ services:
     plan: starter
     dockerfilePath: ./Dockerfile
     healthCheckPath: /
+    numInstances: 1
+    disk:
+      name: wapi-baileys-sessions
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
         value: 5000
+      - key: BAILEYS_SESSION_DIR
+        value: /var/data/baileys-sessions
       - key: MONGO_URI
         sync: false
       - key: REDIS_URL

@@ -9,7 +9,7 @@ import makeWASocket, {
 import QRCode from 'qrcode';
 import fs from 'fs';
 import path from 'path';
-import { getBaileysSessionDir } from '../../../utils/baileys-session-path.js';
+import { fileURLToPath } from 'url';
 import BaseProvider from './base.provider.js';
 import { WhatsappWaba, Message, Contact, WhatsappPhoneNumber, WabaConfiguration } from '../../../models/index.js';
 import pino from 'pino';
@@ -24,6 +24,9 @@ import {
 } from '../../../utils/automated-response.service.js';
 
 const logger = pino({ level: process.env.BAILEYS_LOG_LEVEL || 'warn' });
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 
 const digitsOnly = (value) => String(value || '').replace(/\D/g, '');
 
@@ -52,10 +55,6 @@ export default class BaileysProvider extends BaseProvider {
         this.reconnectTimers = new Map();
         this.reconnectAttempts = new Map();
         this.connectionGenerations = new Map();
-        // Track sockets that are legitimately waiting for QR/connection open.
-        // A Baileys socket has no sock.user until authentication completes, so
-        // sock.user alone must never be used to decide that the socket is stale.
-        this.socketStates = new Map();
         this.io = null;
     }
 
@@ -75,86 +74,32 @@ export default class BaileysProvider extends BaseProvider {
         }
     }
 
-    async resetConnectionSession(wabaId, options = {}) {
-        const socketKey = String(wabaId || '');
-        if (!socketKey) throw new Error('WABA ID is required');
-
-        const deleteSession = options.deleteSession !== false;
-        const socket = this.sockets.get(socketKey);
-
-        const timer = this.reconnectTimers.get(socketKey);
-        if (timer) clearTimeout(timer);
-        this.reconnectTimers.delete(socketKey);
-        this.reconnectAttempts.delete(socketKey);
-
-        // Invalidate every late event from the old socket before closing it.
-        this.connectionGenerations.set(
-            socketKey,
-            (this.connectionGenerations.get(socketKey) || 0) + 1
-        );
-        this.sockets.delete(socketKey);
-        this.socketStates.delete(socketKey);
-
-        try {
-            socket?.end?.(new Error('Resetting WhatsApp connection for a fresh QR'));
-        } catch (error) {
-            console.warn(`Could not close WABA ${socketKey} before QR reset:`, error.message);
-        }
-
-        if (deleteSession) {
-            const sessionDir = getBaileysSessionDir(socketKey);
-            if (fs.existsSync(sessionDir)) {
-                fs.rmSync(sessionDir, { recursive: true, force: true });
-                console.log(`Removed stale Baileys session for WABA ${socketKey}`);
-            }
-        }
-
-        await WhatsappWaba.findByIdAndUpdate(wabaId, {
-            is_active: true,
-            deleted_at: null,
-            connection_status: 'initial',
-            qr_code: null
-        });
-
-        return { success: true, status: 'initial' };
-    }
-
     async initializeConnection(userId, connectionData = null) {
         const wabaId = connectionData?._id || connectionData?.id;
         if (!wabaId) throw new Error('WABA ID is required for Baileys initialization');
 
         const socketKey = wabaId.toString();
-        const sessionDir = getBaileysSessionDir(wabaId);
+        const sessionDir = path.join(process.cwd(), 'storage', 'sessions', 'baileys', wabaId.toString());
 
         if (this.sockets.has(socketKey)) {
             const existingSock = this.sockets.get(socketKey);
-            const existingState = this.socketStates.get(socketKey);
 
+            // A closed Baileys socket can remain in memory with an old database
+            // status. Reuse it only when WhatsApp has assigned a live user JID.
             if (existingSock?.user?.id) {
                 const activePhone = String(existingSock.user.id).split(':')[0].split('@')[0];
                 console.log(`Live socket already active for WABA ${wabaId} (${activePhone})`);
                 return { success: true, status: 'active', phone_number: activePhone };
             }
 
-            // During QR display and the first connection handshake sock.user is
-            // intentionally empty. QR polling used to mistake that valid socket
-            // for a stale one and replace it every ~50 seconds.
-            if (['starting', 'connecting', 'qrcode', 'restarting'].includes(existingState)) {
-                console.log(`Connection already ${existingState} for WABA ${wabaId}; reusing generation ${this.connectionGenerations.get(socketKey) || 0}`);
-                return { success: true, status: existingState };
-            }
-
-            console.log(`Removing genuinely stale socket for WABA ${wabaId} (state: ${existingState || 'unknown'})`);
+            console.log(`Removing stale socket for WABA ${wabaId} before reconnecting`);
             this.sockets.delete(socketKey);
-            this.socketStates.delete(socketKey);
             try {
                 existingSock?.end?.(new Error('Replacing stale WhatsApp socket'));
             } catch (error) {
                 console.warn(`Could not close stale socket for WABA ${wabaId}:`, error.message);
             }
         }
-
-        this.socketStates.set(socketKey, 'starting');
 
         if (!fs.existsSync(sessionDir)) {
             fs.mkdirSync(sessionDir, { recursive: true });
@@ -189,21 +134,8 @@ export default class BaileysProvider extends BaseProvider {
         const generation = (this.connectionGenerations.get(socketKey) || 0) + 1;
         this.connectionGenerations.set(socketKey, generation);
         this.sockets.set(socketKey, sock);
-        this.socketStates.set(socketKey, 'connecting');
 
-        // Persist every credential update serially. Code 515 is WhatsApp asking
-        // the client to restart immediately after pairing; reconnecting before
-        // creds.json is flushed can lose the freshly paired session and show a
-        // new QR again.
-        let credentialsSaveChain = Promise.resolve();
-        sock.ev.on('creds.update', () => {
-            credentialsSaveChain = credentialsSaveChain.then(
-                () => saveCreds(),
-                () => saveCreds()
-            ).catch((saveError) => {
-                console.error(`Failed to save Baileys credentials for WABA ${wabaId}:`, saveError.message);
-            });
-        });
+        sock.ev.on('creds.update', saveCreds);
 
         sock.ev.on('connection.update', async (update) => {
             const { connection, lastDisconnect, qr } = update;
@@ -218,7 +150,6 @@ export default class BaileysProvider extends BaseProvider {
             }
 
             if (qr) {
-                this.socketStates.set(socketKey, 'qrcode');
 
                 const waba = await WhatsappWaba.findById(wabaId);
 
@@ -261,8 +192,6 @@ export default class BaileysProvider extends BaseProvider {
                 const isConnectionReplaced = errorCode === DisconnectReason.connectionReplaced || errorCode === 440;
                 const shouldReconnect = !isLoggedOut && !isQRTimeout && !isConnectionReplaced;
 
-                this.socketStates.set(socketKey, errorCode === 515 ? 'restarting' : 'closed');
-
                 console.log('[Baileys connection closed]', {
                     wabaId: socketKey,
                     phone: extractPhoneNumber(sock, connectionData, state),
@@ -275,11 +204,6 @@ export default class BaileysProvider extends BaseProvider {
                     shouldReconnect,
                     generation
                 });
-
-                // Make sure the pairing credentials are physically written before
-                // replacing a code-515 socket with the restarted connection.
-                await credentialsSaveChain.catch(() => {});
-                if (errorCode === 515) await delay(500);
 
                 if (this.sockets.get(socketKey) === sock) {
                     this.sockets.delete(socketKey);
@@ -299,12 +223,7 @@ export default class BaileysProvider extends BaseProvider {
                     if (!this.reconnectTimers.has(socketKey)) {
                         const attempt = (this.reconnectAttempts.get(socketKey) || 0) + 1;
                         this.reconnectAttempts.set(socketKey, attempt);
-                        // 515 is the expected post-QR restart, not a failure. Restart
-                        // quickly after credentials have been saved; use backoff for
-                        // ordinary network disconnects.
-                        const reconnectDelay = errorCode === 515
-                            ? 750
-                            : Math.min(3_000 * (2 ** Math.min(attempt - 1, 3)), 30_000);
+                        const reconnectDelay = Math.min(3_000 * (2 ** Math.min(attempt - 1, 3)), 30_000);
 
                         const timer = setTimeout(async () => {
                             this.reconnectTimers.delete(socketKey);
@@ -332,7 +251,6 @@ export default class BaileysProvider extends BaseProvider {
                     return;
                 }
 
-                this.socketStates.delete(socketKey);
                 this.reconnectAttempts.delete(socketKey);
                 const pendingTimer = this.reconnectTimers.get(socketKey);
                 if (pendingTimer) clearTimeout(pendingTimer);
@@ -412,9 +330,6 @@ export default class BaileysProvider extends BaseProvider {
                 this.reconnectTimers.delete(socketKey);
                 this.reconnectAttempts.delete(socketKey);
 
-                this.socketStates.set(socketKey, 'connected');
-                await credentialsSaveChain.catch(() => {});
-
                 console.log(`Baileys connection opened for WABA ${wabaId}`);
                 const userJid = String(sock.user?.id || state?.creds?.me?.id || '');
                 const phoneNumber = extractPhoneNumber(sock, connectionData, state);
@@ -423,12 +338,10 @@ export default class BaileysProvider extends BaseProvider {
                     console.warn(`Could not resolve the phone number for WABA ${wabaId}. User JID: ${userJid}`);
                 }
 
-                // Keep one connection per phone inside the same WAPI account. Old
-                // duplicate records are silently archived instead of exposing the
-                // confusing duplicate status to the dashboard.
+                // Only one live WAPI connection may own a WhatsApp number. Clean up
+                // duplicate WABA records so two sockets do not replace each other.
                 if (phoneNumber) {
                     const duplicatePhones = await WhatsappPhoneNumber.find({
-                        user_id: userId,
                         display_phone_number: phoneNumber,
                         waba_id: { $ne: wabaId },
                         is_active: true
@@ -440,45 +353,30 @@ export default class BaileysProvider extends BaseProvider {
 
                         const duplicateSocket = this.sockets.get(duplicateWabaId);
                         try {
-                            duplicateSocket?.end?.(new Error(`Replacing old connection for ${phoneNumber}`));
+                            duplicateSocket?.end?.(new Error(`Duplicate WhatsApp number ${phoneNumber}`));
                         } catch (duplicateError) {
-                            console.warn(`Could not close old WABA ${duplicateWabaId}:`, duplicateError.message);
+                            console.warn(`Could not close duplicate WABA ${duplicateWabaId}:`, duplicateError.message);
                         }
                         this.sockets.delete(duplicateWabaId);
-                        this.socketStates.delete(duplicateWabaId);
-                        this.connectionGenerations.delete(duplicateWabaId);
 
                         const duplicateTimer = this.reconnectTimers.get(duplicateWabaId);
                         if (duplicateTimer) clearTimeout(duplicateTimer);
                         this.reconnectTimers.delete(duplicateWabaId);
                         this.reconnectAttempts.delete(duplicateWabaId);
 
-                        await WhatsappPhoneNumber.findByIdAndUpdate(duplicate._id, {
-                            is_active: false
-                        });
+                        await WhatsappPhoneNumber.findByIdAndUpdate(duplicate._id, { is_active: false });
                         await WhatsappWaba.findByIdAndUpdate(duplicate.waba_id, {
-                            is_active: false,
-                            deleted_at: new Date(),
-                            connection_status: 'disconnected',
+                            connection_status: 'duplicate_disconnected',
                             qr_code: null
                         });
-
-                        const duplicateSessionDir = getBaileysSessionDir(duplicateWabaId);
-                        if (fs.existsSync(duplicateSessionDir)) {
-                            try {
-                                fs.rmSync(duplicateSessionDir, { recursive: true, force: true });
-                            } catch (cleanupError) {
-                                console.warn(`Could not remove old session ${duplicateWabaId}:`, cleanupError.message);
-                            }
-                        }
-
-                        console.log(`Archived old WAPI connection ${duplicateWabaId} for ${phoneNumber}`);
+                        this.emitStatus(duplicate.waba_id, 'duplicate_disconnected', {
+                            phone_number: phoneNumber,
+                            replaced_by_waba_id: socketKey
+                        });
                     }
                 }
 
                 await WhatsappWaba.findByIdAndUpdate(wabaId, {
-                    is_active: true,
-                    deleted_at: null,
                     connection_status: 'connected',
                     qr_code: null,
                     ...(phoneNumber ? {
@@ -487,30 +385,14 @@ export default class BaileysProvider extends BaseProvider {
                     } : {})
                 });
 
-                const phoneMatch = {
-                    user_id: userId,
-                    $or: [
-                        { waba_id: wabaId },
-                        ...(userJid ? [{ phone_number_id: userJid }] : []),
-                        ...(phoneNumber ? [{ display_phone_number: phoneNumber }] : [])
-                    ]
-                };
-
-                // Reuse the existing phone-number document when the same WhatsApp
-                // account is paired again. Creating a new document can hit the
-                // unique phone_number_id index and leave the dashboard stuck even
-                // though the socket itself opened successfully.
                 await WhatsappPhoneNumber.findOneAndUpdate(
-                    phoneMatch,
+                    { waba_id: wabaId },
                     {
                         $set: {
                             user_id: userId,
-                            waba_id: wabaId,
                             phone_number_id: userJid,
                             ...(phoneNumber ? { display_phone_number: phoneNumber } : {}),
-                            is_active: true,
-                            deleted_at: null,
-                            last_used_at: new Date()
+                            is_active: true
                         }
                     },
                     { upsert: true, new: true, setDefaultsOnInsert: true }
@@ -1138,47 +1020,10 @@ export default class BaileysProvider extends BaseProvider {
     }
 
     async getConnectionStatus(userId, connection = null) {
-        if (!connection) {
-            return { connected: false, status: 'not_configured', runtime_state: 'missing' };
-        }
-
-        const wabaId = String(connection._id || connection.id || '');
-        const sock = this.sockets.get(wabaId);
-        const runtimeState = this.socketStates.get(wabaId) || 'idle';
-        const livePhone = extractPhoneNumber(sock, connection, null);
-        const liveConnected = Boolean(sock?.user?.id && runtimeState === 'connected');
-
-        if (liveConnected) {
-            return {
-                connected: true,
-                status: 'connected',
-                runtime_state: runtimeState,
-                phone_number: livePhone,
-                verified_live_socket: true
-            };
-        }
-
-        const transientStates = new Set(['starting', 'connecting', 'qrcode', 'restarting', 'reconnecting']);
-        if (transientStates.has(runtimeState)) {
-            return {
-                connected: false,
-                status: runtimeState === 'restarting' ? 'reconnecting' : runtimeState,
-                runtime_state: runtimeState,
-                phone_number: livePhone,
-                verified_live_socket: false
-            };
-        }
-
-        const storedStatus = String(connection.connection_status || 'unknown');
+        if (!connection) return { connected: false };
         return {
-            connected: false,
-            // A database value of connected is not enough after a process restart;
-            // only a live authenticated socket is reported as connected.
-            status: storedStatus === 'connected' ? 'reconnecting' : storedStatus,
-            stored_status: storedStatus,
-            runtime_state: runtimeState,
-            phone_number: livePhone,
-            verified_live_socket: false
+            connected: connection.connection_status === 'connected',
+            status: connection.connection_status
         };
     }
 

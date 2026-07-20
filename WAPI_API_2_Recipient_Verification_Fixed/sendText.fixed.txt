@@ -1,0 +1,8 @@
+This patch changes sendText so that it:
+
+1. Reads the `exists` field returned by Baileys `onWhatsApp()`.
+2. Rejects numbers for which WhatsApp returns `exists: false`.
+3. Sends to the normalized JID returned by WhatsApp instead of a manually built JID.
+4. Requires a real message ID from `sendMessage()`.
+5. Returns `status: submitted`, `recipient_verified: true`, and `delivered: false`.
+6. Logs the recipient verification result in Render logs.

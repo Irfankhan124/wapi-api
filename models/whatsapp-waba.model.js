@@ -47,7 +47,7 @@ const whatsappWabaSchema = new mongoose.Schema({
 
   connection_status: {
     type: String,
-    enum: ['initial', 'qrcode', 'connecting', 'connected', 'disconnected', 'qr_timeout'],
+    enum: ['initial', 'generating', 'qrcode', 'connecting', 'reconnecting', 'connected', 'disconnected', 'qr_timeout', 'connection_conflict', 'duplicate_disconnected', 'duplicate', 'duplicate_connection'],
     default: 'initial'
   },
 
