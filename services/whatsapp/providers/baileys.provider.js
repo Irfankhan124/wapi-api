@@ -382,10 +382,12 @@ export default class BaileysProvider extends BaseProvider {
                     console.warn(`Could not resolve the phone number for WABA ${wabaId}. User JID: ${userJid}`);
                 }
 
-                // Only one live WAPI connection may own a WhatsApp number. Clean up
-                // duplicate WABA records so two sockets do not replace each other.
+                // Keep one connection per phone inside the same WAPI account. Old
+                // duplicate records are silently archived instead of exposing the
+                // confusing duplicate status to the dashboard.
                 if (phoneNumber) {
                     const duplicatePhones = await WhatsappPhoneNumber.find({
+                        user_id: userId,
                         display_phone_number: phoneNumber,
                         waba_id: { $ne: wabaId },
                         is_active: true
@@ -397,30 +399,51 @@ export default class BaileysProvider extends BaseProvider {
 
                         const duplicateSocket = this.sockets.get(duplicateWabaId);
                         try {
-                            duplicateSocket?.end?.(new Error(`Duplicate WhatsApp number ${phoneNumber}`));
+                            duplicateSocket?.end?.(new Error(`Replacing old connection for ${phoneNumber}`));
                         } catch (duplicateError) {
-                            console.warn(`Could not close duplicate WABA ${duplicateWabaId}:`, duplicateError.message);
+                            console.warn(`Could not close old WABA ${duplicateWabaId}:`, duplicateError.message);
                         }
                         this.sockets.delete(duplicateWabaId);
+                        this.socketStates.delete(duplicateWabaId);
+                        this.connectionGenerations.delete(duplicateWabaId);
 
                         const duplicateTimer = this.reconnectTimers.get(duplicateWabaId);
                         if (duplicateTimer) clearTimeout(duplicateTimer);
                         this.reconnectTimers.delete(duplicateWabaId);
                         this.reconnectAttempts.delete(duplicateWabaId);
 
-                        await WhatsappPhoneNumber.findByIdAndUpdate(duplicate._id, { is_active: false });
+                        await WhatsappPhoneNumber.findByIdAndUpdate(duplicate._id, {
+                            is_active: false
+                        });
                         await WhatsappWaba.findByIdAndUpdate(duplicate.waba_id, {
-                            connection_status: 'duplicate_disconnected',
+                            is_active: false,
+                            deleted_at: new Date(),
+                            connection_status: 'disconnected',
                             qr_code: null
                         });
-                        this.emitStatus(duplicate.waba_id, 'duplicate_disconnected', {
-                            phone_number: phoneNumber,
-                            replaced_by_waba_id: socketKey
-                        });
+
+                        const duplicateSessionDir = path.join(
+                            process.cwd(),
+                            'storage',
+                            'sessions',
+                            'baileys',
+                            duplicateWabaId
+                        );
+                        if (fs.existsSync(duplicateSessionDir)) {
+                            try {
+                                fs.rmSync(duplicateSessionDir, { recursive: true, force: true });
+                            } catch (cleanupError) {
+                                console.warn(`Could not remove old session ${duplicateWabaId}:`, cleanupError.message);
+                            }
+                        }
+
+                        console.log(`Archived old WAPI connection ${duplicateWabaId} for ${phoneNumber}`);
                     }
                 }
 
                 await WhatsappWaba.findByIdAndUpdate(wabaId, {
+                    is_active: true,
+                    deleted_at: null,
                     connection_status: 'connected',
                     qr_code: null,
                     ...(phoneNumber ? {
