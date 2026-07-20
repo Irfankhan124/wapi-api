@@ -1,4 +1,4 @@
-﻿import makeWASocket, {
+import makeWASocket, {
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
@@ -616,26 +616,51 @@ export default class BaileysProvider extends BaseProvider {
     }
 
     async sendMessage(userId, params, connection = null) {
-        const wabaId = connection._id || connection.id;
-        let sock = this.sockets.get(wabaId.toString());
+        if (!connection) throw new Error('WhatsApp connection is required');
 
-        if (!sock) {
+        const wabaId = connection._id || connection.id;
+        if (!wabaId) throw new Error('WABA ID is required');
+
+        const socketKey = wabaId.toString();
+        let sock = this.sockets.get(socketKey);
+
+        // A socket object can remain in memory after the real WhatsApp session died.
+        // Never send through a stale socket just because it exists in the Map.
+        if (!sock?.user) {
+            if (sock) this.sockets.delete(socketKey);
+
             await this.initializeConnection(userId, connection);
-            sock = this.sockets.get(wabaId.toString());
             let attempts = 0;
-            while (!sock?.user && attempts < 10) {
+            while (attempts < 15) {
+                sock = this.sockets.get(socketKey);
+                if (sock?.user) break;
                 await delay(1000);
-                sock = this.sockets.get(wabaId.toString());
-                attempts++;
+                attempts += 1;
             }
         }
 
-        if (!sock) throw new Error('Baileys socket not initialized');
+        if (!sock?.user) {
+            throw new Error('WhatsApp is not actually connected. Reconnect by QR and try again.');
+        }
 
         const { recipientNumber, messageText, messageType: messageTypeInput, mediaUrl, templateId } = params;
-        console.log(`Baileys sending message to ${recipientNumber}: type=${messageTypeInput}, mediaUrl=${mediaUrl}`);
+        const cleanRecipient = String(recipientNumber || '').replace(/\D/g, '');
+        if (!/^\d{10,15}$/.test(cleanRecipient)) {
+            throw new Error(`Invalid recipient phone number: ${recipientNumber}`);
+        }
+
+        // Verify the number exists on WhatsApp before claiming the message was sent.
+        const lookup = typeof sock.onWhatsApp === 'function'
+            ? await sock.onWhatsApp(cleanRecipient)
+            : null;
+        const target = Array.isArray(lookup) ? lookup.find(item => item?.exists) : null;
+        if (Array.isArray(lookup) && !target) {
+            throw new Error(`The number ${cleanRecipient} is not registered on WhatsApp`);
+        }
+
+        console.log(`Baileys sending message to ${cleanRecipient}: type=${messageTypeInput}, mediaUrl=${mediaUrl}`);
         const messageType = messageTypeInput || (mediaUrl ? this.getMediaTypeFromUrl(mediaUrl) : 'text');
-        const jid = `${recipientNumber}@s.whatsapp.net`;
+        const jid = target?.jid || `${cleanRecipient}@s.whatsapp.net`;
 
         let result;
         const isUrl = mediaUrl && mediaUrl.startsWith('http');
@@ -699,11 +724,10 @@ export default class BaileysProvider extends BaseProvider {
         const myNumber = phoneRecord?.display_phone_number || connection.display_phone_number || connection.registred_phone_number;
         const contact = await Contact.findOne({ phone_number: recipientNumber, created_by: userId });
 
-        const waMessageId = result?.key?.id
-            || result?.message?.key?.id
-            || result?.id
-            || result?.messageId
-            || `baileys-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        const waMessageId = result?.key?.id || result?.message?.key?.id;
+        if (!waMessageId) {
+            throw new Error('Baileys returned no real WhatsApp message ID. The message was not confirmed as sent.');
+        }
 
         const savedMessage = await Message.create({
             sender_number: myNumber,
@@ -1098,4 +1122,3 @@ export default class BaileysProvider extends BaseProvider {
         return { success: true };
     }
 }
-
