@@ -68,6 +68,18 @@ export default class BaileysProvider extends BaseProvider {
         this.io = io;
     }
 
+    clearRecipientCache(socketKey, recipient = null) {
+        const prefix = recipient
+            ? `${socketKey}:${recipient}`
+            : `${socketKey}:`;
+
+        for (const key of this.recipientJidCache.keys()) {
+            if (recipient ? key === prefix : key.startsWith(prefix)) {
+                this.recipientJidCache.delete(key);
+            }
+        }
+    }
+
     emitStatus(wabaId, status, data = {}) {
         if (this.io) {
             this.io.emit('whatsapp:connection:update', {
@@ -99,6 +111,7 @@ export default class BaileysProvider extends BaseProvider {
         );
         this.sockets.delete(socketKey);
         this.socketStates.delete(socketKey);
+        this.clearRecipientCache(socketKey);
 
         try {
             socket?.end?.(new Error('Resetting WhatsApp connection for a fresh QR'));
@@ -960,7 +973,10 @@ export default class BaileysProvider extends BaseProvider {
                     try {
                         // onWhatsApp verifies the PN. LID mapping is resolved below
                         // through Baileys' persistent signal repository.
-                        const lookup = await sock.onWhatsApp(cleanRecipient);
+                        // rc13 accepts a complete PN JID reliably. Keep a digits-only
+                        // fallback for older behavior, but never reuse another recipient.
+                        const lookupInput = attempt === 1 ? requestedJid : cleanRecipient;
+                        const lookup = await sock.onWhatsApp(lookupInput);
                         lastLookup = lookup;
                         const target = Array.isArray(lookup)
                             ? lookup.find(item => item?.exists === true && item?.jid)
@@ -992,11 +1008,21 @@ export default class BaileysProvider extends BaseProvider {
                 lastError = lastError || error;
             }
 
-            const preferredJid = lidJid || phoneJid;
-            const fallbackJid = lidJid && lidJid !== phoneJid ? phoneJid : null;
-            const source = lidJid
+            // For outbound messages entered as phone numbers, PN is the stable
+            // destination. A stale LID mapping can return a real message ID while
+            // the customer never receives the message. LID remains an immediate-
+            // error fallback and can be explicitly preferred with an env override.
+            const outboundMode = String(process.env.WAPI_OUTBOUND_ADDRESSING_MODE || 'pn')
+                .trim()
+                .toLowerCase();
+            const preferLid = outboundMode === 'lid';
+            const preferredJid = preferLid && lidJid ? lidJid : phoneJid;
+            const fallbackJid = preferredJid === phoneJid
+                ? (lidJid && lidJid !== phoneJid ? lidJid : null)
+                : phoneJid;
+            const source = preferredJid === lidJid && lidJid
                 ? (verified ? 'lid_mapping_verified' : 'lid_mapping')
-                : (verified ? 'onWhatsApp' : 'direct_phone_fallback');
+                : (verified ? 'phone_jid_verified' : 'direct_phone_fallback');
 
             if (!verified) {
                 console.warn('[Baileys recipient verification unavailable; using resolved address]', {
@@ -1021,7 +1047,9 @@ export default class BaileysProvider extends BaseProvider {
 
             this.recipientJidCache.set(cacheKey, {
                 ...resolved,
-                expiresAt: Date.now() + 6 * 60 * 60 * 1000
+                // Verified mappings may be cached briefly. Unverified mappings are
+                // retried quickly instead of poisoning sends to that customer for hours.
+                expiresAt: Date.now() + (verified ? 30 * 60 * 1000 : 60 * 1000)
             });
             return resolved;
         });
@@ -1183,6 +1211,7 @@ export default class BaileysProvider extends BaseProvider {
                 // Never retry merely because a delivery receipt is delayed, which
                 // could create duplicate customer messages.
                 if (!recipientResolution.fallbackJid || recipientResolution.fallbackJid === jid) {
+                    this.clearRecipientCache(socketKey, cleanRecipient);
                     throw primaryError;
                 }
 
@@ -1193,7 +1222,15 @@ export default class BaileysProvider extends BaseProvider {
                     error: primaryError?.message || String(primaryError)
                 });
                 usedJid = recipientResolution.fallbackJid;
-                return submitToJid(usedJid);
+                try {
+                    return await submitToJid(usedJid);
+                } catch (fallbackError) {
+                    this.clearRecipientCache(socketKey, cleanRecipient);
+                    throw new Error(
+                        `WhatsApp rejected both recipient addresses for +${cleanRecipient}. ` +
+                        `PN/LID errors: ${primaryError?.message || primaryError} | ${fallbackError?.message || fallbackError}`
+                    );
+                }
             }
         });
 
@@ -1275,6 +1312,7 @@ export default class BaileysProvider extends BaseProvider {
             phone_jid: recipientResolution.phoneJid,
             lid_jid: recipientResolution.lidJid,
             addressing_mode: usedJid?.endsWith('@lid') ? 'lid' : 'phone',
+            requested_addressing_mode: String(process.env.WAPI_OUTBOUND_ADDRESSING_MODE || 'pn').toLowerCase(),
             is_delivered: false,
             is_seen: false
         };
