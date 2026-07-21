@@ -294,7 +294,7 @@ export const sendMessage = async (req, res) => {
     }
 
     if (!whatsappPhoneNumberId && connectionId && provider === PROVIDER_TYPES.BAILEY) {
-      const phone = await WhatsappPhoneNumber.findOne({ waba_id: connectionId, deleted_at: null }).lean();
+      const phone = await WhatsappPhoneNumber.findOne({ waba_id: connectionId, user_id: userId, deleted_at: null }).lean();
       if (phone) whatsappPhoneNumberId = phone._id.toString();
     }
 
@@ -364,7 +364,7 @@ export const sendMessage = async (req, res) => {
       });
     }
 
-    const result = await unifiedWhatsAppService.sendMessage(senderId, {
+    const result = await unifiedWhatsAppService.sendMessage(userId, {
       contactId,
       whatsappPhoneNumberId,
       whatsappPhoneNumber,
@@ -403,6 +403,12 @@ export const sendMessage = async (req, res) => {
       result?.key?.id ||
       result?.message?.key?.id ||
       null;
+    const recipientVerified =
+      result.recipient_verified === true
+        ? true
+        : result.recipient_verified === false
+          ? false
+          : null;
 
     if (!waMessageId) {
       return res.status(502).json({
@@ -433,7 +439,7 @@ export const sendMessage = async (req, res) => {
         provider: savedMessage.provider,
         reply_message_id: savedMessage.reply_message_id,
         reaction_message_id: savedMessage.reaction_message_id,
-        recipient_verified: result.recipient_verified !== false,
+        recipient_verified: recipientVerified,
         status: result.status || 'sent',
         created_at: savedMessage.created_at || savedMessage.createdAt,
         updated_at: savedMessage.updated_at || savedMessage.updatedAt
@@ -441,7 +447,7 @@ export const sendMessage = async (req, res) => {
       : {
         ...result,
         wa_message_id: waMessageId,
-        recipient_verified: result.recipient_verified !== false,
+        recipient_verified: recipientVerified,
         status: result.status || 'sent'
       };
 
@@ -450,7 +456,7 @@ export const sendMessage = async (req, res) => {
       message: 'Message submitted to WhatsApp',
       status: result.status || 'sent',
       wa_message_id: waMessageId,
-      recipient_verified: result.recipient_verified !== false,
+      recipient_verified: recipientVerified,
       data: formattedResponse
     });
   } catch (error) {

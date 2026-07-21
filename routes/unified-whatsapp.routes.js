@@ -4,7 +4,7 @@ import { authenticate, authorizeRoles } from '../middlewares/auth.js';
 import { uploadSingle } from '../utils/upload.js';
 import multer from "multer";
 import { checkPermission } from '../middlewares/permission.js';
-import { checkPlanLimit, requireSubscription } from '../middlewares/plan-permission.js';
+import { checkConversationLimit, requireSubscription } from '../middlewares/plan-permission.js';
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -18,7 +18,7 @@ const router = express.Router();
 router.use(authenticate);
 router.use(requireSubscription);
 
-router.post('/send', checkPlanLimit('conversations'), upload.fields([{ name: 'file_url', maxCount: 1 }, { name: 'carousel_files' }]), checkPermission('manage.conversations'), unifiedWhatsAppController.sendMessage);
+router.post('/send', checkConversationLimit, upload.fields([{ name: 'file_url', maxCount: 1 }, { name: 'carousel_files' }]), checkPermission('manage.conversations'), unifiedWhatsAppController.sendMessage);
 router.get('/messages', checkPermission('manage.conversations'), unifiedWhatsAppController.getMessages);
 router.get('/chats', checkPermission('manage.conversations'), unifiedWhatsAppController.getRecentChats);
 router.post('/pin-chat', checkPermission('manage.conversations'), unifiedWhatsAppController.togglePinChat);

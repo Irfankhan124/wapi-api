@@ -56,6 +56,8 @@ export default class BaileysProvider extends BaseProvider {
         // A Baileys socket has no sock.user until authentication completes, so
         // sock.user alone must never be used to decide that the socket is stale.
         this.socketStates = new Map();
+        this.recipientJidCache = new Map();
+        this.recipientLookupChains = new Map();
         this.io = null;
     }
 
@@ -926,6 +928,73 @@ export default class BaileysProvider extends BaseProvider {
         return '';
     }
 
+
+
+    async resolveRecipientJid(sock, socketKey, cleanRecipient) {
+        const cacheKey = `${socketKey}:${cleanRecipient}`;
+        const cached = this.recipientJidCache.get(cacheKey);
+        if (cached && cached.expiresAt > Date.now()) {
+            return { jid: cached.jid, verified: true, source: 'cache' };
+        }
+
+        const requestedJid = `${cleanRecipient}@s.whatsapp.net`;
+        if (typeof sock.onWhatsApp !== 'function') {
+            return { jid: requestedJid, verified: null, source: 'direct_no_lookup' };
+        }
+
+        const previous = this.recipientLookupChains.get(socketKey) || Promise.resolve();
+        const lookupTask = previous.catch(() => {}).then(async () => {
+            let lastLookup = null;
+            let lastError = null;
+
+            for (let attempt = 1; attempt <= 3; attempt += 1) {
+                try {
+                    // Baileys v7 accepts a phone number and may return a LID JID.
+                    // Serializing these USync requests avoids false empty results
+                    // when several customer messages are sent close together.
+                    const lookup = await sock.onWhatsApp(cleanRecipient);
+                    lastLookup = lookup;
+                    const target = Array.isArray(lookup)
+                        ? lookup.find(item => item?.exists === true && item?.jid)
+                        : null;
+
+                    if (target?.jid) {
+                        this.recipientJidCache.set(cacheKey, {
+                            jid: target.jid,
+                            expiresAt: Date.now() + 6 * 60 * 60 * 1000
+                        });
+                        return { jid: target.jid, verified: true, source: 'onWhatsApp', lookup };
+                    }
+                } catch (error) {
+                    lastError = error;
+                }
+
+                if (attempt < 3) await delay(700 * attempt);
+            }
+
+            console.warn('[Baileys recipient lookup unavailable; trying direct PN JID]', {
+                wabaId: socketKey,
+                recipient: cleanRecipient,
+                lookup: lastLookup,
+                error: lastError?.message || null
+            });
+
+            // Empty USync results can be transient/rate-limited. WhatsApp v7 can
+            // still send to the phone-number JID, so let sendMessage be the final
+            // authority instead of blocking every recipient after the first one.
+            return { jid: requestedJid, verified: null, source: 'direct_fallback', lookup: lastLookup };
+        });
+
+        this.recipientLookupChains.set(socketKey, lookupTask);
+        try {
+            return await lookupTask;
+        } finally {
+            if (this.recipientLookupChains.get(socketKey) === lookupTask) {
+                this.recipientLookupChains.delete(socketKey);
+            }
+        }
+    }
+
     async sendMessage(userId, params, connection = null) {
         if (!connection) throw new Error('WhatsApp connection is required');
 
@@ -960,41 +1029,20 @@ export default class BaileysProvider extends BaseProvider {
             throw new Error(`Invalid recipient phone number: ${recipientNumber}`);
         }
 
-        // Baileys expects a WhatsApp JID. Passing only digits can produce an
-        // ambiguous lookup for some accounts, especially after LID migration.
-        const requestedJid = `${cleanRecipient}@s.whatsapp.net`;
-        let lookup = null;
-        if (typeof sock.onWhatsApp === 'function') {
-            lookup = await sock.onWhatsApp(requestedJid);
+        const recipientResolution = await this.resolveRecipientJid(sock, socketKey, cleanRecipient);
+        const jid = recipientResolution.jid;
 
-            // Compatibility fallback for Baileys versions that normalize digits.
-            if (!Array.isArray(lookup) || !lookup.some(item => item?.exists === true && item?.jid)) {
-                const fallbackLookup = await sock.onWhatsApp(cleanRecipient);
-                if (Array.isArray(fallbackLookup) && fallbackLookup.length > 0) {
-                    lookup = fallbackLookup;
-                }
-            }
-        }
-
-        const target = Array.isArray(lookup)
-            ? lookup.find(item => item?.exists === true && item?.jid)
-            : null;
-
-        console.log('[Baileys recipient verification]', {
+        console.log('[Baileys recipient resolution]', {
             wabaId: socketKey,
             sender: String(sock.user?.id || '').split(':')[0].split('@')[0] || null,
             recipient: cleanRecipient,
-            requestedJid,
-            lookup
+            jid,
+            verified: recipientResolution.verified,
+            source: recipientResolution.source
         });
-
-        if (!target?.jid) {
-            throw new Error(`The number +${cleanRecipient} is not registered or could not be verified on WhatsApp`);
-        }
 
         console.log(`Baileys sending message to ${cleanRecipient}: type=${messageTypeInput}, mediaUrl=${mediaUrl}`);
         const messageType = messageTypeInput || (mediaUrl ? this.getMediaTypeFromUrl(mediaUrl) : 'text');
-        const jid = target.jid;
 
         let result;
         const isUrl = mediaUrl && mediaUrl.startsWith('http');
@@ -1119,7 +1167,8 @@ export default class BaileysProvider extends BaseProvider {
             waMessageId,
             status: 'sent',
             submission_status: 'submitted',
-            recipient_verified: true,
+            recipient_verified: recipientResolution.verified,
+            recipient_resolution_source: recipientResolution.source,
             sender_number: myNumber,
             recipient_number: cleanRecipient,
             jid,

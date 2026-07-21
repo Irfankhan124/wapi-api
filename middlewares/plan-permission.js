@@ -164,8 +164,29 @@ async function getUsageCount(userId, feature, subscription) {
       return CustomField.countDocuments({ ...baseQuery, created_by: uid });
     case 'tags':
       return Tag.countDocuments({ ...baseQuery, created_by: uid });
-    case 'conversations':
-      return Message.countDocuments({ ...baseQuery, user_id: uid });
+    case 'conversations': {
+      const result = await Message.aggregate([
+        {
+          $match: {
+            ...baseQuery,
+            user_id: uid,
+            $or: [
+              { contact_id: { $exists: true, $ne: null } },
+              { recipient_number: { $exists: true, $nin: [null, ''] } }
+            ]
+          }
+        },
+        {
+          $group: {
+            _id: {
+              $ifNull: ['$contact_id', '$recipient_number']
+            }
+          }
+        },
+        { $count: 'total' }
+      ]);
+      return result[0]?.total || 0;
+    }
     case 'forms':
       return Form.countDocuments({ ...baseQuery, user_id: uid });
     case 'whatsapp_calling':
@@ -234,6 +255,87 @@ export const checkPlanLimit = (feature) => {
 
     next();
   };
+};
+
+
+
+
+const cleanConversationPhone = (value) => String(value || '').replace(/\D/g, '');
+
+async function hasExistingConversation(userId, body = {}) {
+  const uid = userId instanceof mongoose.Types.ObjectId ? userId : new mongoose.Types.ObjectId(userId);
+  const contactId = body.contact_id;
+  const recipient = cleanConversationPhone(body.contact_no || body.recipient_number || body.phone);
+
+  const clauses = [];
+  if (contactId && mongoose.Types.ObjectId.isValid(contactId)) {
+    clauses.push({ contact_id: new mongoose.Types.ObjectId(contactId) });
+  }
+  if (recipient) {
+    clauses.push({ recipient_number: recipient });
+    const contact = await Contact.findOne({
+      phone_number: recipient,
+      $or: [{ user_id: uid }, { created_by: uid }],
+      deleted_at: null
+    }).select('_id').lean();
+    if (contact?._id) clauses.push({ contact_id: contact._id });
+  }
+
+  if (clauses.length === 0) return false;
+  return Boolean(await Message.exists({
+    user_id: uid,
+    deleted_at: null,
+    $or: clauses
+  }));
+}
+
+// Conversation limits apply to unique recipients, not every outbound message.
+// Existing chats must remain sendable after the plan reaches its new-chat limit.
+export const checkConversationLimit = async (req, res, next) => {
+  try {
+    if (req.user?.role === 'super_admin' || req.isFreeTrial) return next();
+
+    // The server-to-server API key is used by the connected ISP database. It
+    // should not be blocked after the first successful message by a UI quota.
+    const bypassApiKeyLimit = String(process.env.WAPI_API_KEY_BYPASS_CONVERSATION_LIMIT || 'true')
+      .trim()
+      .toLowerCase() !== 'false';
+    if (req.authType === 'api_key' && bypassApiKeyLimit) return next();
+
+    const plan = req.plan;
+    if (!plan?.features) {
+      return res.status(403).json({ success: false, message: 'Plan information not available' });
+    }
+
+    const limit = plan.features.conversations;
+    if (typeof limit !== 'number') {
+      return res.status(403).json({
+        success: false,
+        message: 'Plan does not define a limit for: conversations'
+      });
+    }
+    if (limit <= 0) return next();
+
+    const ownerId = req.user?.owner_id || req.user?._id || req.user?.id;
+    if (!ownerId || !mongoose.Types.ObjectId.isValid(ownerId)) {
+      return res.status(401).json({ success: false, message: 'Authentication required' });
+    }
+
+    if (await hasExistingConversation(ownerId, req.body || {})) return next();
+
+    const currentCount = await getUsageCount(ownerId, 'conversations', req.subscription);
+    if (currentCount >= limit) {
+      return res.status(403).json({
+        success: false,
+        message: `Plan limit reached for new conversations. Your plan allows ${limit} unique recipient${limit === 1 ? '' : 's'}. Existing conversations can still receive messages.`
+      });
+    }
+
+    return next();
+  } catch (error) {
+    console.error('Conversation limit check failed:', error);
+    return res.status(500).json({ success: false, message: 'Could not verify conversation limit' });
+  }
 };
 
 
