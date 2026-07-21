@@ -8,6 +8,7 @@ import { WhatsappConnection } from '../models/index.js';
 import { assignChatToAgent as assignChatToAgentFromChat } from './chat.controller.js';
 import paymentLinkService from '../services/payment-link.service.js';
 import mongoose from 'mongoose';
+import { normalizeWhatsAppNumber, isValidWhatsAppNumber } from '../utils/whatsapp-number.js';
 
 const processedAuthCodes = new Set();
 
@@ -270,11 +271,11 @@ export const sendMessage = async (req, res) => {
     }
 
     if (!contactId && contactNoInput) {
-      const cleanedPhone = contactNoInput.replace(/[\s\-()\+]/g, '');
-      if (!/^\d{6,15}$/.test(cleanedPhone)) {
+      const cleanedPhone = normalizeWhatsAppNumber(contactNoInput, { defaultCountryCode: process.env.WAPI_DEFAULT_COUNTRY_CODE || '93' });
+      if (!isValidWhatsAppNumber(cleanedPhone)) {
         return res.status(400).json({
           success: false,
-          error: 'Contact phone number must be 6-15 digits'
+          error: 'Contact phone number must be a valid international WhatsApp number (10-15 digits)'
         });
       }
 
@@ -283,6 +284,7 @@ export const sendMessage = async (req, res) => {
         contact = await Contact.create({
           phone_number: cleanedPhone,
           name: contactNoInput,
+          metadata: { original_phone_input: contactNoInput },
           user_id: userId,
           created_by: userId,
           status: 'lead'

@@ -15,6 +15,7 @@ import { WhatsappWaba, Message, Contact, WhatsappPhoneNumber, WabaConfiguration 
 import pino from 'pino';
 import automationEngine from '../../../utils/automation-engine.js';
 import { updateWhatsAppStatus } from '../../../utils/message-status.service.js';
+import { normalizeWhatsAppNumber, isValidWhatsAppNumber } from '../../../utils/whatsapp-number.js';
 import {
     isWithinWorkingHours,
     findMatchingBot,
@@ -58,6 +59,8 @@ export default class BaileysProvider extends BaseProvider {
         this.socketStates = new Map();
         this.recipientJidCache = new Map();
         this.recipientLookupChains = new Map();
+        this.sendChains = new Map();
+        this.lastSendAt = new Map();
         this.io = null;
     }
 
@@ -934,55 +937,93 @@ export default class BaileysProvider extends BaseProvider {
         const cacheKey = `${socketKey}:${cleanRecipient}`;
         const cached = this.recipientJidCache.get(cacheKey);
         if (cached && cached.expiresAt > Date.now()) {
-            return { jid: cached.jid, verified: true, source: 'cache' };
+            return {
+                jid: cached.jid,
+                fallbackJid: cached.fallbackJid || null,
+                phoneJid: cached.phoneJid || `${cleanRecipient}@s.whatsapp.net`,
+                lidJid: cached.lidJid || null,
+                verified: cached.verified ?? true,
+                source: 'cache'
+            };
         }
 
         const requestedJid = `${cleanRecipient}@s.whatsapp.net`;
-        if (typeof sock.onWhatsApp !== 'function') {
-            return { jid: requestedJid, verified: null, source: 'direct_no_lookup' };
-        }
-
         const previous = this.recipientLookupChains.get(socketKey) || Promise.resolve();
         const lookupTask = previous.catch(() => {}).then(async () => {
             let lastLookup = null;
             let lastError = null;
+            let verified = null;
+            let phoneJid = requestedJid;
 
-            for (let attempt = 1; attempt <= 3; attempt += 1) {
-                try {
-                    // Baileys v7 accepts a phone number and may return a LID JID.
-                    // Serializing these USync requests avoids false empty results
-                    // when several customer messages are sent close together.
-                    const lookup = await sock.onWhatsApp(cleanRecipient);
-                    lastLookup = lookup;
-                    const target = Array.isArray(lookup)
-                        ? lookup.find(item => item?.exists === true && item?.jid)
-                        : null;
+            if (typeof sock.onWhatsApp === 'function') {
+                for (let attempt = 1; attempt <= 3; attempt += 1) {
+                    try {
+                        // onWhatsApp verifies the PN. LID mapping is resolved below
+                        // through Baileys' persistent signal repository.
+                        const lookup = await sock.onWhatsApp(cleanRecipient);
+                        lastLookup = lookup;
+                        const target = Array.isArray(lookup)
+                            ? lookup.find(item => item?.exists === true && item?.jid)
+                            : null;
 
-                    if (target?.jid) {
-                        this.recipientJidCache.set(cacheKey, {
-                            jid: target.jid,
-                            expiresAt: Date.now() + 6 * 60 * 60 * 1000
-                        });
-                        return { jid: target.jid, verified: true, source: 'onWhatsApp', lookup };
+                        if (target?.jid) {
+                            phoneJid = target.jid;
+                            verified = true;
+                            break;
+                        }
+                    } catch (error) {
+                        lastError = error;
                     }
-                } catch (error) {
-                    lastError = error;
-                }
 
-                if (attempt < 3) await delay(700 * attempt);
+                    if (attempt < 3) await delay(700 * attempt);
+                }
             }
 
-            console.warn('[Baileys recipient lookup unavailable; trying direct PN JID]', {
-                wabaId: socketKey,
-                recipient: cleanRecipient,
-                lookup: lastLookup,
-                error: lastError?.message || null
-            });
+            // Baileys 7 uses LID identities for new Signal sessions. Ask its
+            // persisted LID store for the preferred address instead of relying
+            // only on the older phone-number JID.
+            let lidJid = null;
+            try {
+                const getLIDForPN = sock?.signalRepository?.lidMapping?.getLIDForPN;
+                if (typeof getLIDForPN === 'function') {
+                    lidJid = await getLIDForPN.call(sock.signalRepository.lidMapping, phoneJid);
+                }
+            } catch (error) {
+                lastError = lastError || error;
+            }
 
-            // Empty USync results can be transient/rate-limited. WhatsApp v7 can
-            // still send to the phone-number JID, so let sendMessage be the final
-            // authority instead of blocking every recipient after the first one.
-            return { jid: requestedJid, verified: null, source: 'direct_fallback', lookup: lastLookup };
+            const preferredJid = lidJid || phoneJid;
+            const fallbackJid = lidJid && lidJid !== phoneJid ? phoneJid : null;
+            const source = lidJid
+                ? (verified ? 'lid_mapping_verified' : 'lid_mapping')
+                : (verified ? 'onWhatsApp' : 'direct_phone_fallback');
+
+            if (!verified) {
+                console.warn('[Baileys recipient verification unavailable; using resolved address]', {
+                    wabaId: socketKey,
+                    recipient: cleanRecipient,
+                    preferredJid,
+                    fallbackJid,
+                    lookup: lastLookup,
+                    error: lastError?.message || null
+                });
+            }
+
+            const resolved = {
+                jid: preferredJid,
+                fallbackJid,
+                phoneJid,
+                lidJid,
+                verified,
+                source,
+                lookup: lastLookup
+            };
+
+            this.recipientJidCache.set(cacheKey, {
+                ...resolved,
+                expiresAt: Date.now() + 6 * 60 * 60 * 1000
+            });
+            return resolved;
         });
 
         this.recipientLookupChains.set(socketKey, lookupTask);
@@ -991,6 +1032,32 @@ export default class BaileysProvider extends BaseProvider {
         } finally {
             if (this.recipientLookupChains.get(socketKey) === lookupTask) {
                 this.recipientLookupChains.delete(socketKey);
+            }
+        }
+    }
+
+    async enqueueSocketSend(socketKey, task) {
+        const previous = this.sendChains.get(socketKey) || Promise.resolve();
+        const current = previous.catch(() => {}).then(async () => {
+            const configuredDelay = Number.parseInt(process.env.BAILEYS_SEND_DELAY_MS || '650', 10);
+            const minimumDelay = Number.isFinite(configuredDelay) ? Math.max(0, configuredDelay) : 650;
+            const lastSentAt = this.lastSendAt.get(socketKey) || 0;
+            const remaining = minimumDelay - (Date.now() - lastSentAt);
+            if (remaining > 0) await delay(remaining);
+
+            try {
+                return await task();
+            } finally {
+                this.lastSendAt.set(socketKey, Date.now());
+            }
+        });
+
+        this.sendChains.set(socketKey, current);
+        try {
+            return await current;
+        } finally {
+            if (this.sendChains.get(socketKey) === current) {
+                this.sendChains.delete(socketKey);
             }
         }
     }
@@ -1024,8 +1091,8 @@ export default class BaileysProvider extends BaseProvider {
         }
 
         const { recipientNumber, messageText, messageType: messageTypeInput, mediaUrl, templateId } = params;
-        const cleanRecipient = String(recipientNumber || '').replace(/\D/g, '');
-        if (!/^\d{10,15}$/.test(cleanRecipient)) {
+        const cleanRecipient = normalizeWhatsAppNumber(recipientNumber, { defaultCountryCode: process.env.WAPI_DEFAULT_COUNTRY_CODE || '93' });
+        if (!isValidWhatsAppNumber(cleanRecipient)) {
             throw new Error(`Invalid recipient phone number: ${recipientNumber}`);
         }
 
@@ -1045,60 +1112,93 @@ export default class BaileysProvider extends BaseProvider {
         const messageType = messageTypeInput || (mediaUrl ? this.getMediaTypeFromUrl(mediaUrl) : 'text');
 
         let result;
+        let usedJid = jid;
         const isUrl = mediaUrl && mediaUrl.startsWith('http');
         const isLocalFile = mediaUrl && !isUrl && (mediaUrl.includes('/') || mediaUrl.includes('\\')) && fs.existsSync(mediaUrl);
 
-        const sendOptions = {};
-        if (params.replyMessageId) {
-            sendOptions.quoted = {
-                key: {
-                    id: params.replyMessageId,
-                    remoteJid: jid,
-                    fromMe: false
-                },
-                message: { conversation: '' }
-            };
-        }
+        const buildSendOptions = (targetJid) => {
+            const options = {};
+            if (params.replyMessageId) {
+                options.quoted = {
+                    key: {
+                        id: params.replyMessageId,
+                        remoteJid: targetJid,
+                        fromMe: false
+                    },
+                    message: { conversation: '' }
+                };
+            }
+            return options;
+        };
 
-        if (messageType === 'text' || (!isUrl && !isLocalFile && mediaUrl)) {
-            const textToSend = messageText || (mediaUrl && !isUrl && !isLocalFile ? mediaUrl : '');
-            result = await sock.sendMessage(jid, { text: textToSend }, sendOptions);
-        } else if (messageType === 'image') {
-            result = await sock.sendMessage(jid, { image: { url: mediaUrl }, caption: messageText }, sendOptions);
-        } else if (messageType === 'video') {
-            result = await sock.sendMessage(jid, { video: { url: mediaUrl }, caption: messageText }, sendOptions);
-        } else if (messageType === 'audio') {
-            result = await sock.sendMessage(jid, { audio: { url: mediaUrl }, mimetype: 'audio/mp4' }, sendOptions);
-        } else if (messageType === 'document') {
-            const fileName = this.getFileNameFromUrl(mediaUrl);
-            result = await sock.sendMessage(jid, { document: { url: mediaUrl }, fileName: fileName, caption: messageText }, sendOptions);
-        } else if (messageType === 'location') {
-            const { locationParams } = params;
-            if (locationParams) {
-                result = await sock.sendMessage(jid, {
+        const submitToJid = async (targetJid) => {
+            const sendOptions = buildSendOptions(targetJid);
+            if (messageType === 'text' || (!isUrl && !isLocalFile && mediaUrl)) {
+                const textToSend = messageText || (mediaUrl && !isUrl && !isLocalFile ? mediaUrl : '');
+                return sock.sendMessage(targetJid, { text: textToSend }, sendOptions);
+            }
+            if (messageType === 'image') {
+                return sock.sendMessage(targetJid, { image: { url: mediaUrl }, caption: messageText }, sendOptions);
+            }
+            if (messageType === 'video') {
+                return sock.sendMessage(targetJid, { video: { url: mediaUrl }, caption: messageText }, sendOptions);
+            }
+            if (messageType === 'audio') {
+                return sock.sendMessage(targetJid, { audio: { url: mediaUrl }, mimetype: 'audio/mp4' }, sendOptions);
+            }
+            if (messageType === 'document') {
+                const fileName = this.getFileNameFromUrl(mediaUrl);
+                return sock.sendMessage(targetJid, { document: { url: mediaUrl }, fileName, caption: messageText }, sendOptions);
+            }
+            if (messageType === 'location' && params.locationParams) {
+                return sock.sendMessage(targetJid, {
                     location: {
-                        degreesLatitude: locationParams.latitude,
-                        degreesLongitude: locationParams.longitude,
-                        name: locationParams.name,
-                        address: locationParams.address
+                        degreesLatitude: params.locationParams.latitude,
+                        degreesLongitude: params.locationParams.longitude,
+                        name: params.locationParams.name,
+                        address: params.locationParams.address
                     }
                 }, sendOptions);
             }
-        } else if (messageType === 'reaction') {
-            result = await sock.sendMessage(jid, {
-                react: {
-                    text: params.reactionEmoji,
-                    key: {
-                        id: params.reactionMessageId,
-                        remoteJid: jid,
-                        fromMe: false
+            if (messageType === 'reaction') {
+                return sock.sendMessage(targetJid, {
+                    react: {
+                        text: params.reactionEmoji,
+                        key: {
+                            id: params.reactionMessageId,
+                            remoteJid: targetJid,
+                            fromMe: false
+                        }
                     }
+                });
+            }
+            throw new Error(`Unsupported message type "${messageType}"`);
+        };
+
+        result = await this.enqueueSocketSend(socketKey, async () => {
+            try {
+                return await submitToJid(jid);
+            } catch (primaryError) {
+                // Only retry when Baileys rejected the first address immediately.
+                // Never retry merely because a delivery receipt is delayed, which
+                // could create duplicate customer messages.
+                if (!recipientResolution.fallbackJid || recipientResolution.fallbackJid === jid) {
+                    throw primaryError;
                 }
-            });
-        }
+
+                console.warn('[Baileys preferred JID send failed; retrying phone JID]', {
+                    recipient: cleanRecipient,
+                    preferredJid: jid,
+                    fallbackJid: recipientResolution.fallbackJid,
+                    error: primaryError?.message || String(primaryError)
+                });
+                usedJid = recipientResolution.fallbackJid;
+                return submitToJid(usedJid);
+            }
+        });
 
         if (!result) {
-            throw new Error(`Failed to send message: Unsupported message type "${messageType}" or result undefined`);
+            throw new Error(`Failed to send message: result undefined for type "${messageType}"`);
         }
 
 
@@ -1149,7 +1249,7 @@ export default class BaileysProvider extends BaseProvider {
             from_me: true,
             direction: 'outbound',
             wa_message_id: waMessageId,
-            wa_jid: jid,
+            wa_jid: usedJid,
             wa_timestamp: new Date(),
             provider: 'baileys',
             interactive_data: messageType === 'location' ? {
@@ -1171,7 +1271,10 @@ export default class BaileysProvider extends BaseProvider {
             recipient_resolution_source: recipientResolution.source,
             sender_number: myNumber,
             recipient_number: cleanRecipient,
-            jid,
+            jid: usedJid,
+            phone_jid: recipientResolution.phoneJid,
+            lid_jid: recipientResolution.lidJid,
+            addressing_mode: usedJid?.endsWith('@lid') ? 'lid' : 'phone',
             is_delivered: false,
             is_seen: false
         };

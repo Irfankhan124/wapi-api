@@ -17,6 +17,10 @@ services:
         value: 5000
       - key: BAILEYS_SESSION_DIR
         value: /var/data/baileys-sessions
+      - key: WAPI_DEFAULT_COUNTRY_CODE
+        value: 93
+      - key: BAILEYS_SEND_DELAY_MS
+        value: 650
       - key: MONGO_URI
         sync: false
       - key: REDIS_URL
