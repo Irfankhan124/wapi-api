@@ -4,7 +4,8 @@ import makeWASocket, {
     fetchLatestBaileysVersion,
     makeCacheableSignalKeyStore,
     delay,
-    downloadContentFromMessage
+    downloadContentFromMessage,
+    generateMessageIDV2
 } from '@whiskeysockets/baileys';
 import QRCode from 'qrcode';
 import fs from 'fs';
@@ -61,6 +62,8 @@ export default class BaileysProvider extends BaseProvider {
         this.recipientLookupChains = new Map();
         this.sendChains = new Map();
         this.lastSendAt = new Map();
+        this.deliveryWaiters = new Map();
+        this.deliveryStates = new Map();
         this.io = null;
     }
 
@@ -78,6 +81,73 @@ export default class BaileysProvider extends BaseProvider {
                 this.recipientJidCache.delete(key);
             }
         }
+    }
+
+    markDeliveryState(messageId, status) {
+        const id = String(messageId || '').trim();
+        if (!id || !status) return;
+
+        const rank = { sent: 1, delivered: 2, read: 3 };
+        const current = this.deliveryStates.get(id);
+        if (!current || (rank[status] || 0) >= (rank[current.status] || 0)) {
+            this.deliveryStates.set(id, {
+                status,
+                updatedAt: Date.now()
+            });
+        }
+
+        const waiters = this.deliveryWaiters.get(id) || [];
+        if ((rank[status] || 0) >= rank.delivered && waiters.length > 0) {
+            this.deliveryWaiters.delete(id);
+            for (const waiter of waiters) {
+                clearTimeout(waiter.timer);
+                waiter.resolve(status);
+            }
+        }
+
+        const cleanup = setTimeout(() => {
+            const saved = this.deliveryStates.get(id);
+            if (saved && Date.now() - saved.updatedAt >= 5 * 60 * 1000) {
+                this.deliveryStates.delete(id);
+            }
+        }, 5 * 60 * 1000);
+        cleanup.unref?.();
+    }
+
+    waitForDelivery(messageId, timeoutMs) {
+        const id = String(messageId || '').trim();
+        if (!id) return Promise.resolve(null);
+
+        const current = this.deliveryStates.get(id);
+        if (current && ['delivered', 'read'].includes(current.status)) {
+            return Promise.resolve(current.status);
+        }
+
+        const waitMs = Math.max(1500, Math.min(Number(timeoutMs) || 9000, 30000));
+
+        return new Promise((resolve) => {
+            const waiter = {
+                resolve,
+                timer: setTimeout(() => {
+                    const list = this.deliveryWaiters.get(id) || [];
+                    const next = list.filter(item => item !== waiter);
+                    if (next.length > 0) this.deliveryWaiters.set(id, next);
+                    else this.deliveryWaiters.delete(id);
+
+                    const latest = this.deliveryStates.get(id);
+                    resolve(
+                        latest && ['delivered', 'read'].includes(latest.status)
+                            ? latest.status
+                            : null
+                    );
+                }, waitMs)
+            };
+
+            waiter.timer.unref?.();
+            const list = this.deliveryWaiters.get(id) || [];
+            list.push(waiter);
+            this.deliveryWaiters.set(id, list);
+        });
     }
 
     emitStatus(wabaId, status, data = {}) {
@@ -558,6 +628,7 @@ export default class BaileysProvider extends BaseProvider {
 
                 if (!status) continue;
 
+                this.markDeliveryState(waMessageId, status);
                 console.log(`Baileys receipt: ${waMessageId} -> ${status}`);
                 try {
                     const timestamp = new Date();
@@ -589,6 +660,7 @@ export default class BaileysProvider extends BaseProvider {
                     else if (update.update.status === 4) status = 'read';
 
                     if (status) {
+                        this.markDeliveryState(waMessageId, status);
                         console.log(`Baileys status update: ${waMessageId} -> ${status}`);
                         try {
                             const timestamp = new Date();
@@ -1190,11 +1262,16 @@ export default class BaileysProvider extends BaseProvider {
 
         let result;
         let usedJid = jid;
+        let deliveryStatus = null;
+        let deliveryConfirmed = false;
+        let fallbackAttempted = false;
+        let attemptedJids = [];
         const isUrl = mediaUrl && mediaUrl.startsWith('http');
         const isLocalFile = mediaUrl && !isUrl && (mediaUrl.includes('/') || mediaUrl.includes('\\')) && fs.existsSync(mediaUrl);
 
-        const buildSendOptions = (targetJid) => {
+        const buildSendOptions = (targetJid, messageIdOverride = null) => {
             const options = {};
+            if (messageIdOverride) options.messageId = messageIdOverride;
             if (params.replyMessageId) {
                 options.quoted = {
                     key: {
@@ -1208,8 +1285,8 @@ export default class BaileysProvider extends BaseProvider {
             return options;
         };
 
-        const submitToJid = async (targetJid) => {
-            const sendOptions = buildSendOptions(targetJid);
+        const submitToJid = async (targetJid, messageIdOverride = null) => {
+            const sendOptions = buildSendOptions(targetJid, messageIdOverride);
             if (messageType === 'text' || (!isUrl && !isLocalFile && mediaUrl)) {
                 const textToSend = messageText || (mediaUrl && !isUrl && !isLocalFile ? mediaUrl : '');
                 return sock.sendMessage(targetJid, { text: textToSend }, sendOptions);
@@ -1253,37 +1330,88 @@ export default class BaileysProvider extends BaseProvider {
         };
 
         result = await this.enqueueSocketSend(socketKey, async () => {
+            // WhatsApp's documented personal-address form is PN. Some accounts,
+            // however, now require their verified LID identity. Try PN first and
+            // only move to the next unique address when WhatsApp does not produce
+            // a delivered/read receipt.
             const candidateJids = Array.from(new Set(
                 [
-                    ...(recipientResolution.candidateJids || []),
-                    recipientResolution.jid,
-                    recipientResolution.fallbackJid,
                     recipientResolution.phoneJid,
+                    recipientResolution.jid,
+                    ...(recipientResolution.candidateJids || []),
+                    recipientResolution.fallbackJid,
                     recipientResolution.lidJid
                 ].filter(Boolean)
             ));
 
+            const configuredWait = Number.parseInt(
+                process.env.WAPI_DELIVERY_WAIT_MS || '9000',
+                10
+            );
+            const deliveryWaitMs = Number.isFinite(configuredWait)
+                ? Math.max(2500, Math.min(configuredWait, 30000))
+                : 9000;
+
+            const sharedMessageId = generateMessageIDV2(sock.user?.id);
+            let firstSubmittedResult = null;
             const errors = [];
 
-            for (const targetJid of candidateJids) {
+            for (let index = 0; index < candidateJids.length; index += 1) {
+                const targetJid = candidateJids[index];
+                attemptedJids.push(targetJid);
+                fallbackAttempted = index > 0;
+
                 try {
                     usedJid = targetJid;
-                    console.log('[Baileys recipient send attempt]', {
+
+                    console.log('[Baileys delivery-aware send attempt]', {
                         wabaId: socketKey,
                         recipient: cleanRecipient,
                         targetJid,
-                        addressingMode: targetJid.endsWith('@lid') ? 'lid' : 'phone'
+                        attempt: index + 1,
+                        candidates: candidateJids.length,
+                        messageId: sharedMessageId
                     });
 
-                    return await submitToJid(targetJid);
+                    const submitted = await submitToJid(targetJid, sharedMessageId);
+                    if (!firstSubmittedResult) firstSubmittedResult = submitted;
+
+                    const submittedId =
+                        submitted?.key?.id ||
+                        submitted?.message?.key?.id ||
+                        sharedMessageId;
+
+                    const receipt = await this.waitForDelivery(
+                        submittedId,
+                        deliveryWaitMs
+                    );
+
+                    if (receipt) {
+                        deliveryStatus = receipt;
+                        deliveryConfirmed = true;
+                        console.log('[Baileys delivery confirmed]', {
+                            recipient: cleanRecipient,
+                            targetJid,
+                            messageId: submittedId,
+                            status: receipt
+                        });
+                        return submitted;
+                    }
+
+                    console.warn('[Baileys no delivery receipt; trying alternate address if available]', {
+                        recipient: cleanRecipient,
+                        targetJid,
+                        messageId: submittedId,
+                        waitMs: deliveryWaitMs,
+                        hasAlternate: index < candidateJids.length - 1
+                    });
                 } catch (sendError) {
                     errors.push({
                         jid: targetJid,
                         error: sendError?.message || String(sendError)
                     });
 
-                    console.warn('[Baileys recipient address rejected]', {
-                        wabaId: socketKey,
+                    console.warn('[Baileys recipient address send failed]', {
                         recipient: cleanRecipient,
                         targetJid,
                         error: sendError?.message || String(sendError)
@@ -1291,8 +1419,14 @@ export default class BaileysProvider extends BaseProvider {
                 }
             }
 
-            this.clearRecipientCache(socketKey, cleanRecipient);
+            if (firstSubmittedResult) {
+                // The WhatsApp server accepted at least one submission, but no
+                // delivered/read receipt arrived inside the bounded wait. Keep it
+                // as submitted instead of claiming delivery.
+                return firstSubmittedResult;
+            }
 
+            this.clearRecipientCache(socketKey, cleanRecipient);
             const details = errors
                 .map(item => `${item.jid}: ${item.error}`)
                 .join(' | ');
@@ -1358,6 +1492,11 @@ export default class BaileysProvider extends BaseProvider {
             wa_jid: usedJid,
             wa_timestamp: new Date(),
             provider: 'baileys',
+            delivery_status: deliveryConfirmed ? deliveryStatus : 'submitted',
+            is_delivered: deliveryConfirmed,
+            delivered_at: deliveryConfirmed ? new Date() : null,
+            is_seen: deliveryStatus === 'read',
+            seen_at: deliveryStatus === 'read' ? new Date() : null,
             interactive_data: messageType === 'location' ? {
                 location: params.locationParams
             } : null,
@@ -1371,8 +1510,12 @@ export default class BaileysProvider extends BaseProvider {
             id: savedMessage._id,
             messageId: savedMessage._id,
             waMessageId,
-            status: 'sent',
+            status: deliveryConfirmed ? deliveryStatus : 'submitted',
             submission_status: 'submitted',
+            delivery_confirmed: deliveryConfirmed,
+            delivery_status: deliveryConfirmed ? deliveryStatus : 'submitted',
+            fallback_attempted: fallbackAttempted,
+            attempted_jids: attemptedJids,
             recipient_verified: recipientResolution.verified,
             recipient_resolution_source: recipientResolution.source,
             sender_number: myNumber,
@@ -1383,8 +1526,8 @@ export default class BaileysProvider extends BaseProvider {
             addressing_mode: usedJid?.endsWith('@lid') ? 'lid' : 'phone',
             requested_addressing_mode: String(process.env.WAPI_OUTBOUND_ADDRESSING_MODE || 'auto').toLowerCase(),
             recipient_candidate_jids: recipientResolution.candidateJids || [usedJid],
-            is_delivered: false,
-            is_seen: false
+            is_delivered: deliveryConfirmed,
+            is_seen: deliveryStatus === 'read'
         };
     }
 
