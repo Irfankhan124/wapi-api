@@ -1266,6 +1266,7 @@ export default class BaileysProvider extends BaseProvider {
         let deliveryConfirmed = false;
         let fallbackAttempted = false;
         let attemptedJids = [];
+        let resultAttemptMetadata = [];
         const isUrl = mediaUrl && mediaUrl.startsWith('http');
         const isLocalFile = mediaUrl && !isUrl && (mediaUrl.includes('/') || mediaUrl.includes('\\')) && fs.existsSync(mediaUrl);
 
@@ -1336,10 +1337,10 @@ export default class BaileysProvider extends BaseProvider {
             // a delivered/read receipt.
             const candidateJids = Array.from(new Set(
                 [
-                    recipientResolution.phoneJid,
                     recipientResolution.jid,
                     ...(recipientResolution.candidateJids || []),
                     recipientResolution.fallbackJid,
+                    recipientResolution.phoneJid,
                     recipientResolution.lidJid
                 ].filter(Boolean)
             ));
@@ -1352,8 +1353,9 @@ export default class BaileysProvider extends BaseProvider {
                 ? Math.max(2500, Math.min(configuredWait, 30000))
                 : 9000;
 
-            const sharedMessageId = generateMessageIDV2(sock.user?.id);
-            let firstSubmittedResult = null;
+            let firstSubmittedAttempt = null;
+            let lastSubmittedAttempt = null;
+            const submittedAttempts = [];
             const errors = [];
 
             for (let index = 0; index < candidateJids.length; index += 1) {
@@ -1364,22 +1366,38 @@ export default class BaileysProvider extends BaseProvider {
                 try {
                     usedJid = targetJid;
 
+                    const attemptMessageId = generateMessageIDV2(sock.user?.id);
+
                     console.log('[Baileys delivery-aware send attempt]', {
                         wabaId: socketKey,
                         recipient: cleanRecipient,
                         targetJid,
                         attempt: index + 1,
                         candidates: candidateJids.length,
-                        messageId: sharedMessageId
+                        messageId: attemptMessageId
                     });
 
-                    const submitted = await submitToJid(targetJid, sharedMessageId);
-                    if (!firstSubmittedResult) firstSubmittedResult = submitted;
-
+                    const submitted = await submitToJid(targetJid, attemptMessageId);
                     const submittedId =
                         submitted?.key?.id ||
                         submitted?.message?.key?.id ||
-                        sharedMessageId;
+                        attemptMessageId;
+
+                    const submittedAttempt = {
+                        result: submitted,
+                        jid: targetJid,
+                        messageId: submittedId
+                    };
+
+                    submittedAttempts.push({
+                        jid: targetJid,
+                        message_id: submittedId
+                    });
+
+                    if (!firstSubmittedAttempt) {
+                        firstSubmittedAttempt = submittedAttempt;
+                    }
+                    lastSubmittedAttempt = submittedAttempt;
 
                     const receipt = await this.waitForDelivery(
                         submittedId,
@@ -1395,6 +1413,8 @@ export default class BaileysProvider extends BaseProvider {
                             messageId: submittedId,
                             status: receipt
                         });
+                        usedJid = targetJid;
+                        resultAttemptMetadata = submittedAttempts;
                         return submitted;
                     }
 
@@ -1419,11 +1439,11 @@ export default class BaileysProvider extends BaseProvider {
                 }
             }
 
-            if (firstSubmittedResult) {
-                // The WhatsApp server accepted at least one submission, but no
-                // delivered/read receipt arrived inside the bounded wait. Keep it
-                // as submitted instead of claiming delivery.
-                return firstSubmittedResult;
+            if (lastSubmittedAttempt) {
+                usedJid = lastSubmittedAttempt.jid;
+                resultAttemptMetadata = submittedAttempts;
+                this.clearRecipientCache(socketKey, cleanRecipient);
+                return lastSubmittedAttempt.result;
             }
 
             this.clearRecipientCache(socketKey, cleanRecipient);
@@ -1516,6 +1536,7 @@ export default class BaileysProvider extends BaseProvider {
             delivery_status: deliveryConfirmed ? deliveryStatus : 'submitted',
             fallback_attempted: fallbackAttempted,
             attempted_jids: attemptedJids,
+            submitted_attempts: resultAttemptMetadata,
             recipient_verified: recipientResolution.verified,
             recipient_resolution_source: recipientResolution.source,
             sender_number: myNumber,
